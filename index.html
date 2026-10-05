@@ -354,13 +354,25 @@ const chk = id => { const e = document.getElementById(id); return !!(e && e.chec
 function toast(msg, erro){ const t = $('#toast'); t.textContent = msg; t.className = 'on' + (erro ? ' erro' : ''); clearTimeout(t._t); t._t = setTimeout(() => t.className = '', 3200); }
 function falha(e){ console.error(e); toast('Não foi possível salvar: ' + (e && e.message ? e.message : e), true); }
 
+/* ---------- sessão: quando o login vence, renova e tenta de novo ---------- */
+const ehSessaoVencida = e => /jwt|token|expired|PGRST30|401/i.test(String((e && (e.message || e.code)) || e));
+async function renovarSessao(){
+  const {data, error} = await sb.auth.refreshSession();
+  if (error || !data.session){ fechar(); mostrarLogin('Sua sessão expirou. Entre novamente para continuar.'); throw new Error('sessão expirada, entre novamente'); }
+}
+async function comSessao(fn){
+  if (DEMO) return fn();
+  try { return await fn(); }
+  catch(e){ if (!ehSessaoVencida(e)) throw e; await renovarSessao(); return await fn(); }
+}
+
 /* ---------- camada de dados ---------- */
 const DB = {
   async all(t){
     if (DEMO) return JSON.parse(localStorage.getItem(LK + t) || '[]');
-    let out = [], de = 0;
-    for(;;){ const {data, error} = await sb.from(t).select('*').range(de, de + 999); if (error) throw error; out = out.concat(data); if (data.length < 1000) break; de += 1000; }
-    return out;
+    return comSessao(async () => { let out = [], de = 0;
+      for(;;){ const {data, error} = await sb.from(t).select('*').range(de, de + 999); if (error) throw error; out = out.concat(data); if (data.length < 1000) break; de += 1000; }
+      return out; });
   },
   _grava(t){ localStorage.setItem(LK + t, JSON.stringify(S[t])); },
   async ins(t, o){
@@ -371,17 +383,17 @@ const DB = {
       if (t === 'vendas' && !r.numero) r.numero = Math.max(1000, ...S.vendas.map(v => +v.numero || 0)) + 1;
       S[t].push(r); this._grava(t); return r;
     }
-    const {data, error} = await sb.from(t).insert(o).select().single(); if (error) throw error;
+    const data = await comSessao(async () => { const {data, error} = await sb.from(t).insert(o).select().single(); if (error) throw error; return data; });
     S[t].push(data); return data;
   },
   async upd(t, id, p){
     let r;
     if (DEMO){ const i = S[t].findIndex(x => x.id === id); if (i < 0) throw new Error('registro não encontrado'); r = S[t][i] = {...S[t][i], ...p}; this._grava(t); return r; }
-    const {data, error} = await sb.from(t).update(p).eq('id', id).select().single(); if (error) throw error;
+    const data = await comSessao(async () => { const {data, error} = await sb.from(t).update(p).eq('id', id).select().single(); if (error) throw error; return data; });
     const i = S[t].findIndex(x => x.id === id); if (i >= 0) S[t][i] = data; return data;
   },
   async del(t, id){
-    if (!DEMO){ const {error} = await sb.from(t).delete().eq('id', id); if (error) throw error; }
+    if (!DEMO) await comSessao(async () => { const {error} = await sb.from(t).delete().eq('id', id); if (error) throw error; });
     S[t] = S[t].filter(x => x.id !== id); if (DEMO) this._grava(t);
   }
 };
@@ -389,7 +401,7 @@ const DB = {
 async function carregarTudo(){
   const res = await Promise.all(TABELAS.map(t => DB.all(t)));
   TABELAS.forEach((t, i) => S[t] = res[i]);
-  if (!DEMO && ehGestor()){ const {data} = await sb.from('profiles').select('*'); PERFIS = data || []; }
+  if (!DEMO && ehGestor()) PERFIS = await comSessao(async () => { const {data, error} = await sb.from('profiles').select('*'); if (error) throw error; return data || []; });
 }
 function CFG(){ const c = S.config.find(x => x.id === 1); return Object.assign({
   margem: 0.55, taxas: {'Pix':0,'Dinheiro':0,'Cartão de crédito':0.0399,'Cartão de débito':0.0199,'Link de pagamento':0.0499,'Transferência':0},
@@ -400,7 +412,8 @@ async function salvarCFG(p){ const atual = S.config.find(x => x.id === 1); const
 /* ---------- autenticação ---------- */
 async function iniciar(){
   if (!DEMO){
-    sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {auth: {persistSession: true, autoRefreshToken: true}});
+    sb.auth.onAuthStateChange(ev => { if (ev === 'SIGNED_OUT' && EU) mostrarLogin('Sua sessão foi encerrada. Entre novamente.'); });
     const {data:{session}} = await sb.auth.getSession();
     if (!session){ mostrarLogin(); return; }
     if (!await carregarPerfil(session.user)) return;
@@ -442,7 +455,8 @@ async function abrirApp(){
   if (!U.per) U.per = {de: inicioMes(), ate: fimMes()};
   render();
   document.addEventListener('visibilitychange', async () => {
-    if (document.visibilityState === 'visible' && !DEMO && !$('#modal').classList.contains('on')){ try { await carregarTudo(); render(); } catch(e){} }
+    if (document.visibilityState !== 'visible' || DEMO) return;
+    try { await sb.auth.getSession(); if (!$('#modal').classList.contains('on')){ await carregarTudo(); render(); } } catch(e){}
   });
 }
 async function atualizar(){ try { await carregarTudo(); render(); toast('Dados atualizados'); } catch(e){ falha(e); } }
@@ -478,11 +492,28 @@ const noPer = d => d && d >= U.per.de && d <= U.per.ate;
 /* ---------- modal ---------- */
 function modal(titulo, corpo, pe, larga){
   $('#modal').innerHTML = `<div class="cx${larga ? ' larga' : ''}" role="dialog" aria-modal="true"><div class="cab"><h3>${titulo}</h3><button onclick="fechar()" aria-label="Fechar">×</button></div><div class="corpo">${corpo}</div>${pe ? `<div class="pe">${pe}</div>` : ''}</div>`;
-  $('#modal').classList.add('on'); document.body.style.overflow = 'hidden'; $('#modal').scrollTop = 0;
+  $('#modal').classList.add('on'); document.body.style.overflow = 'hidden'; $('#modal').scrollTop = 0; maiusculasNoModal();
   const f = $('#modal .corpo input, #modal .corpo select'); if (f && window.innerWidth > 700) setTimeout(() => f.focus(), 40);
 }
 function fechar(){ $('#modal').classList.remove('on'); $('#modal').innerHTML = ''; document.body.style.overflow = ''; }
 function confirmar(msg){ return window.confirm(msg); }
+/* ---------- caixa alta nos dados digitados ----------
+   Vale para campos de texto e observações. Ficam de fora: e-mail, senha,
+   usuário de login, datas, números, telefone e qualquer campo com data-livre. */
+const MAIUS = s => String(s).toLocaleUpperCase('pt-BR');
+function campoMaiusculo(el){
+  if (!el || !el.tagName || el.dataset.livre !== undefined || el.closest('#login')) return false;
+  if (el.tagName === 'TEXTAREA') return true;
+  if (el.tagName !== 'INPUT') return false;
+  const tipo = (el.getAttribute('type') || 'text').toLowerCase(), im = el.getAttribute('inputmode');
+  return (tipo === 'text' || tipo === 'search') && (!im || im === 'text');
+}
+document.addEventListener('input', e => { const el = e.target; if (!campoMaiusculo(el)) return;
+  const v = el.value, up = MAIUS(v); if (v === up) return;
+  const a = el.selectionStart, b = el.selectionEnd; el.value = up; try { el.setSelectionRange(a, b); } catch(_){} }, true);
+function maiusculasNoModal(){ document.querySelectorAll('#modal input, #modal textarea').forEach(el => { if (campoMaiusculo(el) && el.value) el.value = MAIUS(el.value); }); }
+/* primeiro nome para mensagens: MARINA ALBUQUERQUE → Marina */
+const primeiroNome = n => { const p = String(n || '').trim().split(/\s+/)[0] || ''; return p.charAt(0).toLocaleUpperCase('pt-BR') + p.slice(1).toLocaleLowerCase('pt-BR'); };
 const fld = (lab, html, cls = '', dica = '') => `<div class="f ${cls}"><label>${lab}</label>${html}${dica ? `<div class="dica">${dica}</div>` : ''}</div>`;
 const inp = (id, v = '', at = '') => `<input id="${id}" value="${esc(v)}" ${at}>`;
 const dec = (id, v, at = '') => `<input id="${id}" inputmode="decimal" value="${v === '' || v == null ? '' : esc(String(v).replace('.',','))}" ${at}>`;
@@ -551,7 +582,7 @@ function vPainel(){
   const aniv = S.clientes.filter(c => c.nascimento && c.nascimento.slice(5,7) === mesAtual).sort((a,b) => a.nascimento.slice(8).localeCompare(b.nascimento.slice(8)));
   const sumir = S.clientes.map(c => ({c, m: metricasCli(c)})).filter(x => x.m.n > 0 && x.m.dias >= CFG().dias_reativar).sort((a,b) => b.m.total - a.m.total).slice(0, 6);
   const saud = new Date().getHours() < 12 ? 'Bom dia' : new Date().getHours() < 18 ? 'Boa tarde' : 'Boa noite';
-  return `<div class="topo"><div><h1 class="tit">${saud}, ${esc((EU.nome || '').split(' ')[0])}.</h1><p class="sub">Lembrar de respirar. Aqui está o mês até agora.</p></div>
+  return `<div class="topo"><div><h1 class="tit">${saud}, ${esc(primeiroNome(EU.nome))}.</h1><p class="sub">Lembrar de respirar. Aqui está o mês até agora.</p></div>
     <div class="acoes"><button class="bt" onclick="formVenda()">Nova venda</button><button class="bt sec" onclick="atualizar()">Atualizar</button></div></div>
   <div class="kpis">
     <div class="kpi escuro"><span>Faturamento do mês</span><b>${brl(r.fat)}</b><small>${r.n} ${r.n === 1 ? 'venda' : 'vendas'}</small></div>
@@ -568,7 +599,7 @@ function vPainel(){
       ${baixoM.length || baixoP.length ? `<ul class="lista">${baixoM.map(m => `<li><span>${esc(m.nome)}<br><span class="mut peq">material · mínimo ${nf(m.minimo)} ${unid(m)}</span></span><span class="bd alerta">${nf(m.qtd)} ${unid(m)}</span></li>`).join('')}${baixoP.map(p => `<li><span>${esc(p.nome)}<br><span class="mut peq">vela pronta · mínimo ${nf(p.estoque_min,0)}</span></span><span class="bd alerta">${nf(p.estoque,0)} un</span></li>`).join('')}</ul>` : '<div class="vazio">Tudo abastecido.</div>'}
     </div>
     <div class="painel"><h3>Aniversariantes do mês</h3>
-      ${aniv.length ? `<ul class="lista">${aniv.map(c => `<li><span><button class="lk" onclick="verCliente('${c.id}')">${esc(c.nome)}</button><br><span class="mut peq">${fd(c.nascimento).slice(0,5)}</span></span>${c.whatsapp ? `<a class="bt zap mini" target="_blank" href="${waLink(c.whatsapp, `Olá, ${c.nome.split(' ')[0]}! ✦ Hoje o acervo acende uma vela por você. Feliz aniversário, da Vespera Acervo.`)}">WhatsApp</a>` : ''}</li>`).join('')}</ul>` : '<div class="vazio">Nenhum aniversário cadastrado neste mês.</div>'}
+      ${aniv.length ? `<ul class="lista">${aniv.map(c => `<li><span><button class="lk" onclick="verCliente('${c.id}')">${esc(c.nome)}</button><br><span class="mut peq">${fd(c.nascimento).slice(0,5)}</span></span>${c.whatsapp ? `<a class="bt zap mini" target="_blank" href="${waLink(c.whatsapp, `Olá, ${primeiroNome(c.nome)}! ✦ Hoje o acervo acende uma vela por você. Feliz aniversário, da Vespera Acervo.`)}">WhatsApp</a>` : ''}</li>`).join('')}</ul>` : '<div class="vazio">Nenhum aniversário cadastrado neste mês.</div>'}
     </div>
     <div class="painel"><h3>Clientes para reativar <span class="mut peq">sem comprar há ${CFG().dias_reativar}+ dias</span></h3>
       ${sumir.length ? `<ul class="lista">${sumir.map(({c,m}) => `<li><span><button class="lk" onclick="verCliente('${c.id}')">${esc(c.nome)}</button><br><span class="mut peq">${m.n} compras · última há ${m.dias} dias</span></span><span class="num">${brl(m.total)}</span></li>`).join('')}</ul>` : '<div class="vazio">Ninguém sumido por enquanto.</div>'}
@@ -662,7 +693,7 @@ function verCliente(id){
   const indicados = S.clientes.filter(x => x.indicado_por === id);
   const prod = {}; comprasCli(c).forEach(v => (v.itens || []).forEach(i => prod[i.nome] = (prod[i.nome] || 0) + (+i.qtd || 0)));
   const fav = Object.entries(prod).sort((a,b) => b[1] - a[1]).slice(0,3);
-  const zap = c.whatsapp ? waLink(c.whatsapp, `Olá, ${c.nome.split(' ')[0]}! ✦ Aqui é da Vespera Acervo.`) : null;
+  const zap = c.whatsapp ? waLink(c.whatsapp, `Olá, ${primeiroNome(c.nome)}! ✦ Aqui é da Vespera Acervo.`) : null;
   modal(esc(c.nome), `
     <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:16px">${bdNivel(m.n)}${c.origem ? `<span class="mut">Conheceu por ${esc(c.origem)}${c.indicado_por ? ' de ' + esc(nomeCli(c.indicado_por)) : ''}${c.origem_detalhe ? ' · ' + esc(c.origem_detalhe) : ''}</span>` : ''}</div>
     <div class="kpis"><div class="kpi"><span>Compras</span><b>${m.n}</b></div><div class="kpi"><span>Total gasto</span><b>${brl(m.total)}</b></div><div class="kpi"><span>Ticket médio</span><b>${brl(m.ticket)}</b></div><div class="kpi"><span>Última compra</span><b style="font-size:21px">${m.ultima ? fd(m.ultima) : '—'}</b><small>${m.dias != null ? `há ${m.dias} dias` : ''}</small></div></div>
@@ -813,7 +844,7 @@ async function salvarVenda(id){
 }
 function msgVenda(v){
   const c = byId('clientes', v.cliente_id), pg = pagoVenda(v), sd = saldoVenda(v);
-  return `Olá${c ? ', ' + c.nome.split(' ')[0] : ''}! ✦\nSeu pedido Nº ${v.numero} na Vespera Acervo:\n\n` +
+  return `Olá${c ? ', ' + primeiroNome(c.nome) : ''}! ✦\nSeu pedido Nº ${v.numero} na Vespera Acervo:\n\n` +
     (v.itens || []).map(i => `• ${i.qtd}× ${i.nome} — ${brl(i.qtd * i.preco)}`).join('\n') +
     (+v.desconto ? `\nDesconto: −${brl(v.desconto)}` : '') + (+v.frete ? `\nFrete: ${brl(v.frete)}` : '') +
     `\n\nTotal: ${brl(v.total)}` + (sd > 0.009 ? (pg > 0 ? `\nJá recebido: ${brl(pg)}\nFalta: ${brl(sd)}` : '') : '\nPagamento confirmado. Obrigada!') +
@@ -1313,8 +1344,8 @@ function vUsuarios(){
 function formUsuario(id){
   const p = id ? PERFIS.find(x => x.id === id) : {papel: 'atendente', ativo: true};
   modal(id ? 'Editar usuário' : 'Novo usuário', `<div class="fg">${fld('Nome *', inp('u_nome', p.nome))}
-    ${id ? fld('Usuário', `<input value="${esc(p.usuario)}" disabled>`) : fld('Usuário para login *', inp('u_user', '', 'autocapitalize="none" placeholder="Ex.: ana"'), '', 'Só letras minúsculas, números, ponto ou traço.')}
-    ${id ? '' : fld('Senha inicial *', inp('u_senha', '', 'type="text" placeholder="mínimo 6 caracteres"'), '', 'A pessoa pode trocar depois em "Minha senha".')}
+    ${id ? fld('Usuário', `<input value="${esc(p.usuario)}" disabled data-livre>`) : fld('Usuário para login *', inp('u_user', '', 'autocapitalize="none" data-livre placeholder="Ex.: ana"'), '', 'Só letras minúsculas, números, ponto ou traço.')}
+    ${id ? '' : fld('Senha inicial *', inp('u_senha', '', 'type="text" data-livre placeholder="mínimo 6 caracteres"'), '', 'A pessoa pode trocar depois em "Minha senha".')}
     ${fld('Acesso', `<select id="u_papel" ${id === EU.id ? 'disabled' : ''}>${opts([['atendente','Atendente'],['gestor','Gestor(a)']], p.papel)}</select>`)}
     ${id && id !== EU.id ? fld('Situação', `<select id="u_ativo">${opts([['1','Ativo'],['0','Sem acesso (bloqueado)']], p.ativo ? '1' : '0')}</select>`) : ''}</div>`,
   `<button class="bt sec" onclick="fechar()">Cancelar</button><button class="bt" id="btU" onclick="salvarUsuario('${id || ''}')">Salvar usuário</button>`);
@@ -1323,7 +1354,7 @@ async function salvarUsuario(id){
   const nome = val('u_nome').trim(); if (!nome) return toast('Informe o nome.', true);
   try {
     if (id){ const patch = {nome}; if (id !== EU.id){ patch.papel = val('u_papel'); patch.ativo = val('u_ativo') === '1'; }
-      const {error} = await sb.from('profiles').update(patch).eq('id', id); if (error) throw error; }
+      await comSessao(async () => { const {error} = await sb.from('profiles').update(patch).eq('id', id); if (error) throw error; }); }
     else {
       const usuario = val('u_user').trim().toLowerCase(), senha = val('u_senha');
       if (!/^[a-z0-9._-]{2,}$/.test(usuario)) return toast('Usuário inválido. Use letras minúsculas, números, ponto ou traço.', true);
@@ -1333,9 +1364,9 @@ async function salvarUsuario(id){
       const {data, error} = await tmp.auth.signUp({email: usuario + '@' + DOMINIO_LOGIN, password: senha, options: {data: {nome, usuario}}});
       if (error) throw new Error(/registered/i.test(error.message) ? 'esse usuário já existe' : error.message);
       if (!data.user || (data.user.identities && !data.user.identities.length)) throw new Error('esse usuário já existe');
-      const {error: e2} = await sb.from('profiles').update({nome, usuario, papel: val('u_papel'), ativo: true}).eq('id', data.user.id); if (e2) throw e2;
+      await comSessao(async () => { const {error: e2} = await sb.from('profiles').update({nome, usuario, papel: val('u_papel'), ativo: true}).eq('id', data.user.id); if (e2) throw e2; });
     }
-    const {data} = await sb.from('profiles').select('*'); PERFIS = data || [];
+    PERFIS = await comSessao(async () => { const {data, error} = await sb.from('profiles').select('*'); if (error) throw error; return data || []; });
     if (id === EU.id) { EU.nome = nome; $('#quem').textContent = nome; }
     fechar(); render(); toast('Usuário salvo');
   } catch(e){ const b = $('#btU'); if (b) b.disabled = false; falha(e); }
