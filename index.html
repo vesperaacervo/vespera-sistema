@@ -263,6 +263,7 @@ table.t tfoot td{border-top:1px solid var(--linha);font-weight:700}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 @media print{#side,.acoes,.filtros,.tabs,.demo{display:none!important}#app{display:block}#main{padding:0}}
 .painel.vazio{padding:16px 20px}
+.f input[type=checkbox]{width:18px;height:18px;padding:0;margin:0;flex:none;accent-color:var(--bordo)}
 
 </style>
 </head>
@@ -669,7 +670,7 @@ function formCliente(id, depois){
   <div class="fg">${fld('Endereço', inp('c_end', c.endereco), 'w2')}${fld('Bairro / região', inp('c_bairro', c.bairro))}${fld('Cidade', inp('c_cid', c.cidade ?? (id ? '' : 'Brasília')))}</div>
   <div class="secao"><h3>Preferências</h3></div>
   <div class="fg">${fld('Aromas preferidos', inp('c_aromas', c.aromas, 'placeholder="Ex.: lavanda, âmbar, nada muito doce"'), 'full')}${fld('Observações', `<textarea id="c_obs">${esc(c.obs)}</textarea>`, 'full')}</div>`,
-  `${id && ehGestor() ? `<button class="bt perigo esq" onclick="excluirCliente('${id}')">Excluir</button>` : ''}<button class="bt sec" onclick="fechar()">Cancelar</button><button class="bt" onclick="salvarCliente('${id || ''}', ${depois ? `'${depois}'` : 'null'})">Salvar cliente</button>`);
+  `${id ? `<button class="bt perigo esq" onclick="excluirCliente('${id}')">Excluir</button>` : ''}<button class="bt sec" onclick="fechar()">Cancelar</button><button class="bt" onclick="salvarCliente('${id || ''}', ${depois ? `'${depois}'` : 'null'})">Salvar cliente</button>`);
 }
 async function salvarCliente(id, depois){
   const o = {nome: val('c_nome').trim(), whatsapp: soDig(val('c_zap')), instagram: val('c_ig').trim(), email: val('c_email').trim(), nascimento: val('c_nasc') || null,
@@ -974,7 +975,7 @@ function formProduto(id){
   <div class="linhas" id="linhasR"></div>
   <div id="calcP" class="caixa" style="margin-top:14px"></div>
   ${fld('Observações', `<textarea id="p_obs">${esc(p.obs)}</textarea>`, 'full')}`,
-  `${id && g ? `<button class="bt perigo esq" onclick="excluirProduto('${id}')">Excluir</button>` : ''}<button class="bt sec" onclick="fechar()">Cancelar</button><button class="bt" onclick="salvarProduto('${id || ''}')">Salvar produto</button>`, true);
+  `${id ? `<button class="bt perigo esq" onclick="excluirProduto('${id}')">Excluir</button>` : ''}<button class="bt sec" onclick="fechar()">Cancelar</button><button class="bt" onclick="salvarProduto('${id || ''}')">Salvar produto</button>`, true);
   renderReceita();
 }
 function renderReceita(){
@@ -1030,7 +1031,7 @@ function vEstoque(){
     ${ms.map(m => { const d = despMaterial(m.id), baixo = (+m.minimo || 0) > 0 && (+m.qtd || 0) <= +m.minimo; return `<tr><td class="prim"><button class="lk" onclick="formMaterial('${m.id}')">${esc(m.nome)}</button>${m.fornecedor ? `<br><span class="mut peq">${esc(m.fornecedor)}</span>` : ''}</td><td data-l="Categoria">${esc(m.categoria || '—')}</td>
       <td class="n" data-l="Em estoque"><span class="${baixo ? 'bd alerta' : ''}">${nf(m.qtd)} ${unid(m)}</span></td><td class="n" data-l="Mínimo">${m.minimo ? nf(m.minimo) + ' ' + unid(m) : '—'}</td><td class="n" data-l="Custo por ${unid(m)}">${brl4(m.custo_unit)}/${unid(m)}</td><td class="n" data-l="Valor">${brl(Math.max(0, +m.qtd || 0) * (+m.custo_unit || 0))}</td>
       <td class="n" data-l="Desperdício médio">${d.real ? `${pct(d.pct)} <span class="mut peq">(${nf(d.perda)} ${unid(m)})</span>` : '—'}</td>
-      <td style="white-space:nowrap"><button class="bt mini" onclick="formEntrada('${m.id}')">Entrada</button> <button class="bt sec mini" onclick="formAjuste('${m.id}')">Saída / ajuste</button></td></tr>`; }).join('')}</tbody></table></div>`
+      <td style="white-space:nowrap"><button class="bt mini" onclick="formEntrada('${m.id}')">Entrada</button> <button class="bt sec mini" onclick="formAjuste('${m.id}')">Saída / ajuste</button> <button class="lk peq" style="margin-left:6px" onclick="excluirMaterial('${m.id}')">excluir</button></td></tr>`; }).join('')}</tbody></table></div>`
     : '<div class="painel vazio">Nenhum material. Comece pela cera, essências, pavios e recipientes — cada um com sua unidade (g, ml ou unidade).</div>';
   }
   if (at === 'producao'){
@@ -1068,32 +1069,67 @@ const FATORES = {g: [['1','g'],['1000','kg']], ml: [['1','ml'],['1000','litro']]
 
 function formMaterial(id){
   const m = id ? byId('materiais', id) : {unidade: 'g', categoria: 'Cera'};
+  const un = unid(m);
+  const blocoValor = id
+    ? `<div class="secao"><h3>Custo</h3><span class="mut peq">hoje: ${brl4(m.custo_unit)} por ${un}</span></div>
+       <p class="mut peq" style="margin-top:0">Para corrigir o custo, informe uma quantidade e quanto ela custou. Deixe em branco para manter o custo atual.</p>
+       <div class="fg">${fld('Quantidade', `<div style="display:grid;grid-template-columns:1fr auto;gap:6px">${dec('m_qtd', '', 'oninput="calcMat()"')}<select id="m_fat" onchange="calcMat()" style="width:auto">${opts(FATORES[un] || FATORES.un, '1')}</select></div>`)}
+       ${fld('Valor pago por essa quantidade (R$)', dec('m_valor', '', 'oninput="calcMat()"'))}</div>`
+    : `<div class="secao"><h3>Estoque e custo</h3></div>
+       <div class="fg">${fld('Quantidade que você tem agora', `<div style="display:grid;grid-template-columns:1fr auto;gap:6px">${dec('m_qtd', '', 'oninput="calcMat()"')}<select id="m_fat" onchange="calcMat()" style="width:auto">${opts(FATORES.g, '1')}</select></div>`, '', 'Ex.: 2 kg de cera → 2 e escolha "kg".')}
+       ${fld('Valor total pago (R$)', dec('m_valor', '', 'oninput="calcMat()"'), '', 'Quanto custou essa quantidade toda. O sistema calcula o valor por unidade.')}
+       <div class="f full"><label style="display:flex;gap:8px;align-items:center;color:var(--txt)"><input type="checkbox" id="m_gasto"> Lançar esse valor como compra no Financeiro</label><div class="dica">Marque só se a compra foi feita agora. Material comprado antes de usar o sistema não precisa entrar como gasto.</div></div></div>`;
   modal(id ? 'Editar material' : 'Novo material', `<div class="fg">
     ${fld('Nome *', inp('m_nome', m.nome, 'placeholder="Ex.: Cera vegetal de soja"'), 'w2')}
     ${fld('Categoria', `<select id="m_cat">${opts(CAT_MAT, m.categoria)}</select>`)}
-    ${fld('Unidade de controle', `<select id="m_un" ${id ? 'disabled' : ''}>${opts([['g','gramas (g)'],['ml','mililitros (ml)'],['un','unidades'],['m','metros']], m.unidade)}</select>`, '', 'Cera em gramas, essência em ml. 1 kg = 1.000 g.')}
-    ${id ? '' : fld('Quantidade atual em estoque', dec('m_qtd', ''), '', 'Na unidade escolhida. Ex.: 2 kg de cera → 2000')}
-    ${fld('Custo por unidade (R$)', dec('m_custo', m.custo_unit || '', ''), '', 'Ex.: cera a R$ 45 o kg → 0,045 por g. As entradas recalculam o custo médio.')}
-    ${fld('Estoque mínimo', dec('m_min', m.minimo || ''), '', 'Avisa no Painel quando chegar nesse nível.')}
+    ${fld('Unidade de controle', `<select id="m_un" onchange="trocaUnMat()" ${id ? 'disabled' : ''}>${opts([['g','gramas (g)'],['ml','mililitros (ml)'],['un','unidades'],['m','metros']], m.unidade)}</select>`, '', id ? 'Não pode ser alterada depois de criado.' : 'Cera em gramas, essência em ml.')}
+    ${fld('Estoque mínimo', dec('m_min', m.minimo || ''), '', 'Na unidade de controle. Avisa no Painel quando chegar nesse nível.')}
     ${fld('Fornecedor', inp('m_forn', m.fornecedor))}
-    ${fld('Observações', inp('m_obs', m.obs), 'full')}</div>`,
-  `${id && ehGestor() ? `<button class="bt perigo esq" onclick="excluirMaterial('${id}')">Excluir</button>` : ''}<button class="bt sec" onclick="fechar()">Cancelar</button><button class="bt" onclick="salvarMaterial('${id || ''}')">Salvar material</button>`);
+    ${fld('Observações', inp('m_obs', m.obs), 'full')}</div>
+    ${blocoValor}
+    <div class="caixa" id="m_res" style="margin-top:12px"></div>`,
+  `${id ? `<button class="bt perigo esq" onclick="excluirMaterial('${id}')">Excluir</button>` : ''}<button class="bt sec" onclick="fechar()">Cancelar</button><button class="bt" onclick="salvarMaterial('${id || ''}')">Salvar material</button>`);
+  calcMat();
+}
+function trocaUnMat(){ const u = val('m_un'); $('#m_fat').innerHTML = opts(FATORES[u] || FATORES.un, '1'); calcMat(); }
+function calcMat(){
+  const box = $('#m_res'); if (!box) return;
+  const u = document.getElementById('m_un').value || 'un', q = pn(val('m_qtd')) * pn(val('m_fat') || 1), v = pn(val('m_valor'));
+  if (q > 0 && v > 0) box.innerHTML = `${nf(q)} ${u} por ${brl(v)} → <b>${brl4(v / q)} por ${u}</b>`;
+  else if (q > 0) box.innerHTML = `${nf(q)} ${u}. <span class="mut">Informe o valor pago para calcular o custo por ${u}.</span>`;
+  else box.innerHTML = '<span class="mut">Informe a quantidade e o valor pago.</span>';
 }
 async function salvarMaterial(id){
-  const o = {nome: val('m_nome').trim(), categoria: val('m_cat'), custo_unit: pn(val('m_custo')), minimo: pn(val('m_min')), fornecedor: val('m_forn').trim(), obs: val('m_obs').trim()};
-  if (!id) o.unidade = val('m_un');
+  const o = {nome: val('m_nome').trim(), categoria: val('m_cat'), minimo: pn(val('m_min')), fornecedor: val('m_forn').trim(), obs: val('m_obs').trim()};
   if (!o.nome) return toast('Informe o nome do material.', true);
+  const q = pn(val('m_qtd')) * pn(val('m_fat') || 1), v = r2(pn(val('m_valor')));
+  if (v > 0 && !(q > 0)) return toast('Informe a quantidade que corresponde a esse valor.', true);
+  if (q > 0 && v > 0) o.custo_unit = Math.round(v / q * 1e6) / 1e6;
+  if (!id && S.materiais.some(x => x.nome === o.nome)) return toast('Já existe um material com esse nome. Edite o existente ou exclua a duplicata.', true);
   try {
     if (id) await DB.upd('materiais', id, o);
-    else { const q = pn(val('m_qtd')); const r = await DB.ins('materiais', {...o, qtd: q});
-      if (q) await DB.ins('movimentos', {data: hoje(), material_id: r.id, tipo: 'inicial', qtd: q, valor: r2(q * o.custo_unit), obs: 'Saldo inicial'}); }
+    else {
+      o.unidade = val('m_un'); if (o.custo_unit == null) o.custo_unit = 0;
+      const r = await DB.ins('materiais', {...o, qtd: q});
+      if (q){ const mv = await DB.ins('movimentos', {data: hoje(), material_id: r.id, tipo: 'inicial', qtd: q, valor: v, obs: 'Saldo inicial'});
+        if (chk('m_gasto') && v > 0) await DB.ins('gastos', {data: hoje(), categoria: 'Compra de material', descricao: `${o.nome} · ${nf(q)} ${o.unidade}`, valor: v, forma: '', pago: true, movimento_id: mv.id}); }
+    }
     fechar(); render(); toast('Material salvo');
   } catch(e){ falha(e); }
 }
 async function excluirMaterial(id){
-  if (S.produtos.some(p => (p.receita || []).some(l => l.material_id === id))) return toast('Este material está na receita de algum produto. Remova da receita antes.', true);
-  if (!confirmar('Excluir este material e o histórico de movimentações dele?')) return;
-  try { for (const mv of S.movimentos.filter(x => x.material_id === id)) await DB.del('movimentos', mv.id); await DB.del('materiais', id); fechar(); render(); toast('Material excluído'); } catch(e){ falha(e); }
+  const m = byId('materiais', id);
+  const usados = S.produtos.filter(p => (p.receita || []).some(l => l.material_id === id));
+  if (usados.length) return toast(`Este material está na receita de: ${usados.map(p => p.nome).join(', ')}. Tire da receita antes de excluir.`, true);
+  if (!confirmar(`Excluir o material "${m.nome}" e o histórico de movimentações dele?`)) return;
+  const movs = S.movimentos.filter(x => x.material_id === id), ids = movs.map(x => x.id);
+  const gastos = S.gastos.filter(g => g.movimento_id && ids.includes(g.movimento_id));
+  const apagarGastos = gastos.length && confirmar(`Esse material tem ${gastos.length} compra(s) lançada(s) no Financeiro, somando ${brl(gastos.reduce((s, g) => s + (+g.valor || 0), 0))}. Apagar também essas compras?\n\nOK = apagar · Cancelar = manter no Financeiro`);
+  try {
+    if (apagarGastos) for (const g of gastos) await DB.del('gastos', g.id);
+    for (const mv of movs) await DB.del('movimentos', mv.id);
+    await DB.del('materiais', id); fechar(); render(); toast('Material excluído');
+  } catch(e){ falha(e); }
 }
 function formEntrada(id){
   const m = byId('materiais', id);
@@ -1417,6 +1453,34 @@ async function exemplo(){
     await DB.ins('gastos', {data, categoria: cat, descricao: desc, valor: v, pago: true});
   render(); toast('Dados de exemplo carregados');
 }
+
+/* =====================================================================
+   TRAVA CONTRA CLIQUE DUPLO
+   Enquanto uma gravação está em andamento, novos cliques são ignorados e os
+   botões da janela ficam desativados, mostrando "Salvando…". Evita itens duplicados
+   quando a internet está lenta.
+   ===================================================================== */
+let OCUPADO = false, ULTIMO_BOTAO = null;
+document.addEventListener('click', e => { ULTIMO_BOTAO = e.target.closest ? e.target.closest('button') : null; }, true);
+function travar(nome){
+  const fn = window[nome]; if (typeof fn !== 'function') return;
+  window[nome] = async function(...args){
+    if (OCUPADO) return;
+    OCUPADO = true;
+    const bts = [...document.querySelectorAll('#modal .pe button')], alvo = ULTIMO_BOTAO, txt = alvo ? alvo.textContent : '';
+    bts.forEach(b => b.disabled = true);
+    if (alvo){ alvo.disabled = true; if (alvo.classList.contains('bt') && !alvo.classList.contains('perigo')) alvo.textContent = 'Salvando…'; }
+    try { return await fn.apply(this, args); }
+    finally {
+      OCUPADO = false;
+      bts.forEach(b => { if (b.isConnected) b.disabled = false; });
+      if (alvo && alvo.isConnected){ alvo.disabled = false; alvo.textContent = txt; }
+    }
+  };
+}
+['salvarCliente','excluirCliente','salvarVenda','mudarStatus','excluirVenda','salvarPagamento','excluirPagamento','salvarProduto','excluirProduto',
+ 'salvarMaterial','excluirMaterial','salvarEntrada','salvarAjuste','salvarAjusteProd','salvarProducao','excluirProducao','salvarGasto','excluirGasto',
+ 'aplicarPreco','salvarAjustes','salvarUsuario','salvarSenha'].forEach(travar);
 
 /* =====================================================================
    INÍCIO
