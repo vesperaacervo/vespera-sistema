@@ -265,6 +265,9 @@ table.t tfoot td{border-top:1px solid var(--linha);font-weight:700}
 .painel.vazio{padding:16px 20px}
 .f input[type=checkbox]{width:18px;height:18px;padding:0;margin:0;flex:none;accent-color:var(--bordo)}
 
+.nw{white-space:nowrap}
+@media (min-width:701px){.est table.t td{white-space:nowrap}}
+
 </style>
 </head>
 <body>
@@ -305,14 +308,17 @@ const DOMINIO_LOGIN = 'vespera.sistema'; // usuário "ana" vira ana@vespera.sist
 
 const DEMO = !SUPABASE_URL || !SUPABASE_KEY;
 const LK = 'vespera_demo_';
-const TABELAS = ['clientes','produtos','materiais','movimentos','producoes','vendas','pagamentos','gastos','config'];
+const TABELAS = ['clientes','produtos','materiais','movimentos','producoes','vendas','pagamentos','gastos','cupons','config'];
 
 /* ---------- listas fixas ---------- */
-const ORIGENS = ['Indicação','Instagram','TikTok','Facebook','Google','Feira / evento','Loja física','Site','Outro'];
+const ORIGENS = ['Indicação','Instagram','TikTok','Live','Facebook','Google','Feira / evento','Loja física','Site','Outro'];
 const CANAIS = ['WhatsApp','Instagram','Site','Presencial','Feira / evento','Outro'];
 const STATUS = ['Orçamento','Confirmada','Em produção','Pronta','Entregue','Cancelada'];
 const STATUS_CL = {'Orçamento':'orc','Confirmada':'conf','Em produção':'prod','Pronta':'pronta','Entregue':'ent','Cancelada':'canc'};
-const FORMAS = ['Pix','Dinheiro','Cartão de crédito','Cartão de débito','Link de pagamento','Transferência'];
+const FORMAS = ['Pix','Dinheiro','Cartão de crédito','Cartão de débito'];
+const PARCELAS = [1,2,3];
+/* tipos de movimentação de material */
+const TIPO_MOV = {entrada:'Entrada', inicial:'Saldo inicial', producao:'Produção', perda:'Perda / quebra', teste:'Teste', ajuste:'Contagem', saida:'Saída'};
 const LINHAS = ['Luz','Sombra','Dual'];
 const CAT_MAT = ['Cera','Essência','Pavio','Recipiente','Tampa','Corante','Rótulo','Embalagem','Outro'];
 const UNIDADES = {g:'g',ml:'ml',un:'un',m:'m'};
@@ -400,12 +406,12 @@ const DB = {
 };
 
 async function carregarTudo(){
-  const res = await Promise.all(TABELAS.map(t => DB.all(t)));
+  const res = await Promise.all(TABELAS.map(t => t === 'cupons' ? DB.all(t).catch(e => { console.warn('Tabela cupons ainda não existe. Rode o SQL de atualização.', e); S._semCupons = true; return []; }) : DB.all(t)));
   TABELAS.forEach((t, i) => S[t] = res[i]);
   if (!DEMO && ehGestor()) PERFIS = await comSessao(async () => { const {data, error} = await sb.from('profiles').select('*'); if (error) throw error; return data || []; });
 }
 function CFG(){ const c = S.config.find(x => x.id === 1); return Object.assign({
-  margem: 0.55, taxas: {'Pix':0,'Dinheiro':0,'Cartão de crédito':0.0399,'Cartão de débito':0.0199,'Link de pagamento':0.0499,'Transferência':0},
+  margem: 0.55, taxas: {'Pix':0,'Dinheiro':0,'Cartão de crédito':0.0399,'Cartão de débito':0.0199},
   taxaMedia: 0.02, dias_reativar: 60}, c ? c.dados : {}); }
 async function salvarCFG(p){ const atual = S.config.find(x => x.id === 1); const dados = {...(atual ? atual.dados : {}), ...p};
   if (atual) await DB.upd('config', 1, {dados}); else await DB.ins('config', {id:1, dados}); }
@@ -549,25 +555,52 @@ function metricasCli(c){
   return {n: vs.length, total: tot, ticket: vs.length ? tot / vs.length : 0, ultima: ult, dias: ult ? diasEntre(ult, hoje()) : null,
     primeira: vs.length ? vs[vs.length - 1].data : null, indicou: S.clientes.filter(x => x.indicado_por === c.id).length};
 }
-function nivel(n){ if (n >= 7) return [4,'VIP Acervo']; if (n >= 4) return [3,'Fiel']; if (n >= 2) return [2,'Recorrente']; if (n === 1) return [1,'Nova']; return [0,'Sem compras']; }
+/* fidelidade: 1 compra = Nova · 2 = Recorrente · 3 ou mais = Fiel · 7 ou mais = VIP Acervo */
+function nivel(n){ if (n >= 7) return [4,'VIP Acervo']; if (n >= 3) return [3,'Fiel']; if (n === 2) return [2,'Recorrente']; if (n === 1) return [1,'Nova']; return [0,'Sem compras']; }
 const bdNivel = n => { const [k,l] = nivel(n); return `<span class="bd nv${k}">${l}</span>`; };
 const nomeCli = id => { const c = byId('clientes', id); return c ? c.nome : 'Cliente avulso'; };
 const resumoItens = v => (v.itens || []).map(i => `${i.qtd}× ${i.nome}`).join(', ');
 
+/* ---------- desperdício ----------
+   Conta como desperdício: (1) o que a produção usou além da receita, (2) perdas e quebras,
+   (3) diferença NEGATIVA na contagem de estoque. Testes ficam separados (não são desperdício). */
+function classeMov(mv){ const q = +mv.qtd || 0;
+  if (mv.tipo === 'perda' || mv.tipo === 'saida') return 'perda';
+  if (mv.tipo === 'ajuste') return q < 0 ? 'contagem' : 'sobra';
+  if (mv.tipo === 'teste') return 'teste';
+  return null; }
+function perdasEstoque(de, ate, mid){
+  const r = {prodQ: 0, prodV: 0, perdaQ: 0, perdaV: 0, contQ: 0, contV: 0, testeQ: 0, testeV: 0, usadoQ: 0};
+  S.producoes.filter(p => !de || (p.data >= de && p.data <= ate)).forEach(p => (p.consumo || []).forEach(c => {
+    if (mid && c.material_id !== mid) return; const w = Math.max(0, (+c.real || 0) - (+c.previsto || 0));
+    r.usadoQ += +c.real || 0; r.prodQ += w; r.prodV += w * (+c.custo_unit || 0); }));
+  S.movimentos.filter(m => (!de || (m.data >= de && m.data <= ate)) && (!mid || m.material_id === mid)).forEach(m => {
+    const k = classeMov(m), q = Math.abs(+m.qtd || 0), v = Math.abs(+m.valor || 0);
+    if (k === 'perda'){ r.perdaQ += q; r.perdaV += v; r.usadoQ += q; }
+    if (k === 'contagem'){ r.contQ += q; r.contV += v; r.usadoQ += q; }
+    if (k === 'teste'){ r.testeQ += q; r.testeV += v; r.usadoQ += q; } });
+  r.despQ = r.prodQ + r.perdaQ + r.contQ; r.despV = r.prodV + r.perdaV + r.contV;
+  r.pct = r.usadoQ ? r.despQ / r.usadoQ : NaN;
+  return r;
+}
 function resumoFin(de, ate){
   const vs = S.vendas.filter(v => ATIVA(v.status) && v.data >= de && v.data <= ate);
   const fat = vs.reduce((s, v) => s + (+v.total || 0), 0);
   const cmv = vs.reduce((s, v) => s + (+v.custo_total || 0), 0);
   const fretes = vs.reduce((s, v) => s + (+v.frete || 0), 0);
+  const cupons = vs.reduce((s, v) => s + (+v.cupom_desconto || 0) + (+v.frete_dispensado || 0), 0);
   const pgs = S.pagamentos.filter(p => p.data >= de && p.data <= ate);
-  const rec = pgs.reduce((s, p) => s + (+p.valor || 0), 0);
+  const juros = pgs.reduce((s, p) => s + (+p.juros_valor || 0), 0);
+  const rec = pgs.reduce((s, p) => s + (+p.valor || 0), 0) + juros;
   const taxas = pgs.reduce((s, p) => s + (+p.taxa || 0), 0);
   const gs = S.gastos.filter(g => g.data >= de && g.data <= ate);
   const compras = gs.filter(g => g.categoria === 'Compra de material').reduce((s, g) => s + (+g.valor || 0), 0);
   const desp = gs.filter(g => g.categoria !== 'Compra de material').reduce((s, g) => s + (+g.valor || 0), 0);
-  const desperd = S.producoes.filter(p => p.data >= de && p.data <= ate).reduce((s, p) => s + (+p.desperdicio_custo || 0), 0);
-  const bruto = fat - cmv, liq = bruto - taxas - desp;
-  return {vs, n: vs.length, fat, cmv, fretes, rec, taxas, compras, desp, desperd, bruto, liq, margem: fat ? liq / fat : NaN, ticket: vs.length ? fat / vs.length : 0, caixa: rec - taxas - compras - desp};
+  const pe = perdasEstoque(de, ate);
+  const perdas = pe.perdaV + pe.contV, testes = pe.testeV;
+  const bruto = fat - cmv, liq = bruto + juros - taxas - desp - perdas - testes;
+  return {vs, n: vs.length, fat, cmv, fretes, cupons, rec, juros, taxas, compras, desp, desperd: pe.despV, perdas, testes, pe, bruto, liq,
+    margem: fat ? liq / fat : NaN, ticket: vs.length ? fat / vs.length : 0, caixa: rec - taxas - compras - desp};
 }
 
 /* =====================================================================
@@ -723,12 +756,19 @@ function vendasFiltradas(){
     .sort((a,b) => (b.data || '').localeCompare(a.data || '') || (b.numero || 0) - (a.numero || 0));
 }
 function vVendas(){
+  const at = subAt('vendas', 'pedidos');
+  if (at === 'cupons') return `<div class="topo"><div><h1 class="tit">Vendas</h1><p class="sub">Cupons de desconto e o retorno de cada um.</p></div>
+    <div class="acoes"><button class="bt" onclick="formCupom()">Novo cupom</button></div></div>` + tabs('vendas', [['pedidos','Pedidos'],['cupons','Cupons']]) + vCupons();
+  return vPedidos();
+}
+function vPedidos(){
   const f = U.filtro.ven || (U.filtro.ven = {q:'', status:'', canal:'', pag:''});
   const lista = vendasFiltradas(), ativas = lista.filter(v => ATIVA(v.status));
   const fat = ativas.reduce((s, v) => s + (+v.total || 0), 0);
   const porCanal = {}; ativas.forEach(v => porCanal[v.canal || 'Outro'] = (porCanal[v.canal || 'Outro'] || 0) + (+v.total || 0));
   return `<div class="topo"><div><h1 class="tit">Vendas</h1><p class="sub">Cada pedido, do orçamento à entrega.</p></div>
     <div class="acoes"><button class="bt" onclick="formVenda()">Nova venda</button></div></div>
+  ${tabs('vendas', [['pedidos','Pedidos'],['cupons','Cupons']])}
   <div class="filtros">${filtroPeriodo()}</div>
   <div class="kpis"><div class="kpi escuro"><span>Faturamento no período</span><b>${brl(fat)}</b><small>${ativas.length} vendas válidas</small></div>
     <div class="kpi"><span>Ticket médio</span><b>${brl(ativas.length ? fat / ativas.length : 0)}</b></div>
@@ -773,16 +813,21 @@ function formVenda(id, clienteId){
   <div class="secao"><h3>Itens</h3><button class="bt sec mini" onclick="addLinhaV()">Adicionar item</button></div>
   <div class="ln lh"><span>Produto</span><span>Qtd</span><span>Preço un.</span><span style="text-align:right">Subtotal</span><span></span></div>
   <div class="linhas" id="linhasV"></div>
-  <div class="fg" style="margin-top:14px">${fld('Desconto (R$)', dec('v_desc', v.desconto || '', 'oninput="totaisV()"'))}${fld('Frete cobrado (R$)', dec('v_frete', v.frete || '', 'oninput="totaisV()"'))}</div>
+  <div class="fg" style="margin-top:14px">
+    ${fld('Cupom', `<select id="v_cupom" onchange="totaisV()">${opts(cuponsParaVenda(v.cupom_id).map(c => [c.id, c.codigo + ' · ' + descCupom(c)]), v.cupom_id, 'Sem cupom')}</select>`, '', S._semCupons ? 'Rode o SQL de atualização para ativar os cupons.' : '')}
+    ${fld('Desconto extra (R$)', dec('v_desc', v.desconto || '', 'oninput="totaisV()"'), '', 'Além do cupom, se houver.')}
+    ${fld('Frete cobrado (R$)', dec('v_frete', v.frete || '', 'oninput="totaisV()"'))}
+    <div class="f" id="boxFdisp" style="display:none"><label>Valor do frete dispensado (R$)</label>${dec('v_fdisp', v.frete_dispensado || '', 'oninput="totaisV()"')}<div class="dica">Quanto o frete custaria. Entra no custo do cupom.</div></div>
+  </div>
   <div class="totais" id="totV"></div>
   <div class="secao"><h3>Entrega</h3></div>
   <div class="fg">${fld('Forma', `<select id="v_ent">${opts(['Retirada','Entrega','Envio pelos Correios','Entregue na hora'], v.entrega)}</select>`)}${fld('Data combinada', inp('v_dent', v.data_entrega, 'type="date"'))}${fld('Endereço de entrega', inp('v_endent', v.endereco_entrega, 'placeholder="Se diferente do cadastro"'), 'w2')}
   ${fld('Observações do pedido', `<textarea id="v_obs" placeholder="Ex.: embrulho para presente, cartão com mensagem">${esc(v.obs)}</textarea>`, 'full')}</div>
   ${id ? '' : `<div class="secao"><h3>Pagamento</h3></div>
   <label style="display:flex;gap:8px;align-items:center;margin-bottom:10px"><input type="checkbox" id="v_pagar" onchange="document.getElementById('boxPag').style.display=this.checked?'':'none'"> Registrar pagamento agora</label>
-  <div class="fg" id="boxPag" style="display:none">${fld('Valor recebido (R$)', dec('p_valor', ''))}${fld('Forma', `<select id="p_forma">${opts(FORMAS, 'Pix')}</select>`)}${fld('Data', inp('p_data', hoje(), 'type="date"'))}</div>`}`,
+  <div id="boxPag" style="display:none">${camposPagamento('p', '')}</div>`}`,
   `<button class="bt sec" onclick="fechar()">Cancelar</button><button class="bt" id="btSalvarV" onclick="salvarVenda('${id || ''}')">Salvar venda</button>`, true);
-  renderLinhasV();
+  renderLinhasV(); if (!id) calcPag('p');
 }
 function filtrarCli(q){ q = q.toLowerCase(); const d = soDig(q); const sel = $('#v_cli');
   [...sel.options].forEach((o, i) => { if (i === 0) return; const t = o.textContent.toLowerCase(); o.hidden = !!q && !(t.includes(q) || (d && soDig(t).includes(d))); });
@@ -802,11 +847,16 @@ function addLinhaV(){ VF.itens.push({produto_id:'', nome:'', qtd:1, preco:0, cus
 function escolheProdV(i, pid){ const p = byId('produtos', pid); VF.itens[i] = {...VF.itens[i], produto_id: pid, nome: p ? p.nome : '', preco: p ? +p.preco || 0 : 0, custo: p ? custoReal(p) : 0}; renderLinhasV(); }
 function totaisV(){
   VF.itens.forEach((it, i) => { const e = document.getElementById('stV' + i); if (e) e.textContent = brl(it.qtd * it.preco); });
-  const sub = VF.itens.reduce((s, it) => s + it.qtd * it.preco, 0), d = pn(val('v_desc')), fr = pn(val('v_frete'));
-  const tot = r2(sub - d + fr);
-  $('#totV').innerHTML = `<span class="mut">Subtotal ${brl(sub)}${d ? ' · desconto ' + brl(d) : ''}${fr ? ' · frete ' + brl(fr) : ''}</span><b>${brl(tot)}</b>`;
-  const pv = document.getElementById('p_valor'); if (pv && !pv.dataset.mexido){ pv.value = String(tot).replace('.',','); pv.oninput = () => pv.dataset.mexido = 1; }
-  return {sub, d, fr, tot};
+  const sub = VF.itens.reduce((s, it) => s + it.qtd * it.preco, 0), d = pn(val('v_desc'));
+  const cp = byId('cupons', val('v_cupom')), fg = !!(cp && cp.tipo === 'frete_gratis');
+  const cd = cp && cp.tipo === 'percentual' ? r2(sub * (+cp.percentual || 0) / 100) : 0;
+  const fe = $('#v_frete'); if (fg){ fe.value = '0'; fe.disabled = true; } else fe.disabled = false;
+  $('#boxFdisp').style.display = fg ? '' : 'none';
+  const fr = fg ? 0 : pn(val('v_frete')), fdisp = fg ? pn(val('v_fdisp')) : 0;
+  const tot = r2(sub - cd - d + fr);
+  $('#totV').innerHTML = `<span class="mut">Subtotal ${brl(sub)}${cd ? ` · cupom ${esc(cp.codigo)} −${brl(cd)}` : ''}${d ? ' · desconto −' + brl(d) : ''}${fr ? ' · frete ' + brl(fr) : ''}${fg ? ' · frete grátis' : ''}</span><b>${brl(tot)}</b>`;
+  const pv = document.getElementById('p_valor'); if (pv && !pv.dataset.mexido){ pv.value = String(tot).replace('.',','); calcPag('p'); }
+  return {sub, d, fr, tot, cp, cd, fdisp};
 }
 /* aplica no estoque de velas prontas a diferença entre a versão antiga e a nova da venda */
 async function estoqueVenda(antiga, nova){
@@ -820,7 +870,7 @@ async function estoqueVenda(antiga, nova){
 async function salvarVenda(id){
   const itens = VF.itens.filter(i => i.produto_id && i.qtd > 0);
   if (!itens.length) return toast('Adicione ao menos um item com produto e quantidade.', true);
-  const {sub, d, fr, tot} = totaisV();
+  const {sub, d, fr, tot, cp, cd, fdisp} = totaisV();
   if (tot < 0) return toast('O desconto é maior que o valor da venda.', true);
   const novoCli = $('#cliNovo') && $('#cliNovo').style.display !== 'none';
   if (novoCli && !val('n_nome').trim()) return toast('Informe o nome do cliente novo.', true);
@@ -831,13 +881,14 @@ async function salvarVenda(id){
     if (novoCli){ const c = await DB.ins('clientes', {nome: val('n_nome').trim(), whatsapp: soDig(val('n_zap')), origem: val('n_origem'), cidade: 'Brasília'}); cliente_id = c.id; }
     const antiga = id ? JSON.parse(JSON.stringify(byId('vendas', id))) : null;
     const o = {data: val('v_data') || hoje(), cliente_id, canal: val('v_canal'), status: val('v_status'), itens,
-      subtotal: r2(sub), desconto: r2(d), frete: r2(fr), total: tot, custo_total: r2(itens.reduce((s, i) => s + i.qtd * (+i.custo || 0), 0)),
+      subtotal: r2(sub), desconto: r2(d), frete: r2(fr), total: tot,
+      cupom_id: cp ? cp.id : null, cupom_codigo: cp ? cp.codigo : null, cupom_desconto: r2(cd), frete_dispensado: r2(fdisp), custo_total: r2(itens.reduce((s, i) => s + i.qtd * (+i.custo || 0), 0)),
       entrega: val('v_ent'), data_entrega: val('v_dent') || null, endereco_entrega: val('v_endent').trim(), obs: val('v_obs').trim(), vendedor: EU.nome || EU.usuario};
     if (id) delete o.vendedor;
     o.estoque_baixado = ATIVA(o.status);
     const r = id ? await DB.upd('vendas', id, o) : await DB.ins('vendas', o);
     await estoqueVenda(antiga, o);
-    if (!id && chk('v_pagar')){ const valor = pn(val('p_valor')); if (valor > 0) await gravarPagamento(r.id, valor, val('p_forma'), val('p_data')); }
+    if (!id && chk('v_pagar')){ const pg = lerPagamento('p'); if (pg.valor > 0) await gravarPagamento(r.id, pg); }
     const neg = itens.map(i => byId('produtos', i.produto_id)).filter(p => p && (+p.estoque || 0) < 0);
     toast(neg.length ? `Venda salva. Atenção: estoque negativo em ${neg.map(p => p.nome).join(', ')} — registre a produção.` : 'Venda salva');
     verVenda(r.id); render();
@@ -847,10 +898,11 @@ function msgVenda(v){
   const c = byId('clientes', v.cliente_id), pg = pagoVenda(v), sd = saldoVenda(v);
   return `Olá${c ? ', ' + primeiroNome(c.nome) : ''}! ✦\nSeu pedido Nº ${v.numero} na Vespera Acervo:\n\n` +
     (v.itens || []).map(i => `• ${i.qtd}× ${i.nome} — ${brl(i.qtd * i.preco)}`).join('\n') +
-    (+v.desconto ? `\nDesconto: −${brl(v.desconto)}` : '') + (+v.frete ? `\nFrete: ${brl(v.frete)}` : '') +
+    (+v.cupom_desconto ? `\nCupom ${v.cupom_codigo}: −${brl(v.cupom_desconto)}` : '') + (+v.desconto ? `\nDesconto: −${brl(v.desconto)}` : '') +
+    (+v.frete ? `\nFrete: ${brl(v.frete)}` : '') + (cupomFG(v) ? `\nFrete grátis com o cupom ${v.cupom_codigo}` : '') +
     `\n\nTotal: ${brl(v.total)}` + (sd > 0.009 ? (pg > 0 ? `\nJá recebido: ${brl(pg)}\nFalta: ${brl(sd)}` : '') : '\nPagamento confirmado. Obrigada!') +
     (v.data_entrega ? `\n${v.entrega === 'Retirada' ? 'Retirada' : 'Entrega'} combinada para ${fd(v.data_entrega)}.` : '') +
-    `\n\nPequenos rituais, grandes retornos.`;
+    `\n\nCom aromas o seu ritual ganha sentido.`;
 }
 function verVenda(id){
   const v = byId('vendas', id); if (!v) return;
@@ -866,10 +918,10 @@ function verVenda(id){
     <div class="f" style="max-width:260px;margin:14px 0"><label>Mudar status</label><select onchange="mudarStatus('${id}',this.value)">${opts(STATUS, v.status)}</select></div>
     <div class="tblw"><table class="t"><thead><tr><th>Item</th><th class="n">Qtd</th><th class="n">Preço</th><th class="n">Subtotal</th></tr></thead><tbody>
       ${(v.itens || []).map(i => `<tr><td>${esc(i.nome)}</td><td class="n">${i.qtd}</td><td class="n">${brl(i.preco)}</td><td class="n">${brl(i.qtd * i.preco)}</td></tr>`).join('')}</tbody>
-      <tfoot>${+v.desconto ? `<tr><td colspan="3">Desconto</td><td class="n">−${brl(v.desconto)}</td></tr>` : ''}${+v.frete ? `<tr><td colspan="3">Frete</td><td class="n">${brl(v.frete)}</td></tr>` : ''}<tr><td colspan="3">Total</td><td class="n">${brl(v.total)}</td></tr></tfoot></table></div>
+      <tfoot>${+v.cupom_desconto ? `<tr><td colspan="3">Cupom ${esc(v.cupom_codigo)}</td><td class="n">−${brl(v.cupom_desconto)}</td></tr>` : ''}${cupomFG(v) ? `<tr><td colspan="3">Frete grátis · cupom ${esc(v.cupom_codigo)}</td><td class="n">${+v.frete_dispensado ? '(' + brl(v.frete_dispensado) + ')' : '—'}</td></tr>` : ''}${+v.desconto ? `<tr><td colspan="3">Desconto</td><td class="n">−${brl(v.desconto)}</td></tr>` : ''}${+v.frete ? `<tr><td colspan="3">Frete</td><td class="n">${brl(v.frete)}</td></tr>` : ''}<tr><td colspan="3">Total</td><td class="n">${brl(v.total)}</td></tr></tfoot></table></div>
     ${ehGestor() ? `<p class="mut peq" style="margin:8px 2px 0">Custo dos produtos ${brl(v.custo_total)} · lucro bruto ${brl((+v.total || 0) - (+v.custo_total || 0) - (+v.frete || 0))}</p>` : ''}
     <div class="secao"><h3>Pagamentos</h3>${ATIVA(v.status) && sd > 0.009 ? `<button class="bt mini" onclick="formPagamento('${id}')">Registrar pagamento</button>` : ''}</div>
-    ${pgs.length ? `<ul class="lista">${pgs.sort((a,b) => (a.data || '').localeCompare(b.data || '')).map(p => `<li><span>${fd(p.data)} · ${esc(p.forma)}${+p.taxa ? ` <span class="mut peq">(taxa ${brl(p.taxa)})</span>` : ''}${p.obs ? `<br><span class="mut peq">${esc(p.obs)}</span>` : ''}</span><span><span class="num">${brl(p.valor)}</span> ${ehGestor() ? `<button class="lk peq" style="margin-left:8px" onclick="excluirPagamento('${p.id}','${id}')">excluir</button>` : ''}</span></li>`).join('')}</ul>` : '<div class="vazio">Nenhum pagamento registrado.</div>'}
+    ${pgs.length ? `<ul class="lista">${pgs.sort((a,b) => (a.data || '').localeCompare(b.data || '')).map(p => `<li><span>${fd(p.data)} · ${descPag(p)}${+p.juros_valor ? ` <span class="mut peq">(+${brl(p.juros_valor)} de juros)</span>` : ''}${+p.taxa ? ` <span class="mut peq">(taxa ${brl(p.taxa)})</span>` : ''}${p.obs ? `<br><span class="mut peq">${esc(p.obs)}</span>` : ''}</span><span><span class="num">${brl(p.valor)}</span> ${ehGestor() ? `<button class="lk peq" style="margin-left:8px" onclick="excluirPagamento('${p.id}','${id}')">excluir</button>` : ''}</span></li>`).join('')}</ul>` : '<div class="vazio">Nenhum pagamento registrado.</div>'}
     ${ATIVA(v.status) ? `<p style="margin:10px 2px 0">${sd > 0.009 ? `Falta receber <b>${brl(sd)}</b>` : sd < -0.009 ? `Recebido a mais: ${brl(-sd)}` : 'Venda quitada.'}</p>` : ''}`,
   `${ehGestor() ? `<button class="bt perigo esq" onclick="excluirVenda('${id}')">Excluir</button>` : ''}${zap ? `<a class="bt zap" target="_blank" href="${zap}">Enviar resumo no WhatsApp</a>` : ''}<button class="bt sec" onclick="formVenda('${id}')">Editar</button>`, true);
 }
@@ -890,23 +942,50 @@ async function excluirVenda(id){
 /* =====================================================================
    PAGAMENTOS
    ===================================================================== */
-async function gravarPagamento(venda_id, valor, forma, data, obs, taxa){
-  const tx = taxa != null ? taxa : r2(valor * (CFG().taxas[forma] || 0));
-  return DB.ins('pagamentos', {venda_id, valor: r2(valor), forma, data: data || hoje(), taxa: tx, obs: obs || '', registrado_por: EU.nome || EU.usuario});
+/* Pagamento no formato da Akeleta: no cartão de crédito informa-se a % de juros e as parcelas;
+   o sistema calcula quanto o cliente paga. "valor" é o que abate da venda; os juros são receita extra. */
+const ehCredito = f => f === 'Cartão de crédito';
+function camposPagamento(pre, valor){
+  return `<div class="fg">${fld('Valor da venda a receber (R$) *', dec(pre + '_valor', valor, `oninput="this.dataset.mexido=1;calcPag('${pre}')"`))}
+    ${fld('Forma', `<select id="${pre}_forma" onchange="calcPag('${pre}')">${opts(FORMAS, 'Pix')}</select>`)}
+    ${fld('Data', inp(pre + '_data', hoje(), 'type="date"'))}</div>
+  <div class="fg" id="${pre}_cartao" style="display:none;margin-top:12px">
+    ${fld('% de juros', dec(pre + '_juros', '0', `oninput="calcPag('${pre}')"`), '', 'Juros repassados ao cliente.')}
+    ${fld('Parcelas', `<select id="${pre}_parc" onchange="calcPag('${pre}')">${opts(PARCELAS.map(n => [n, n + 'x']), 1)}</select>`)}</div>
+  <div class="caixa" id="${pre}_res" style="margin-top:12px"></div>
+  <div class="fg" style="margin-top:12px">${fld('Taxa da maquininha (R$)', dec(pre + '_taxa', '', `oninput="this.dataset.mexido=1"`), '', 'O que a loja paga à maquininha. Calculada pelas taxas em Financeiro › Ajustes; pode corrigir.')}
+    ${fld('Observação', inp(pre + '_obs', '', 'placeholder="Ex.: sinal de 50%"'), 'w2')}</div>`;
 }
+function calcPag(pre){
+  const box = document.getElementById(pre + '_res'); if (!box) return;
+  const p = lerPagamento(pre), cred = ehCredito(p.forma);
+  document.getElementById(pre + '_cartao').style.display = cred ? '' : 'none';
+  const cobrado = r2(p.valor + p.juros_valor);
+  box.innerHTML = p.valor > 0 ? (cred
+    ? `Cliente paga <b>${brl(cobrado)}</b>${p.parcelas > 1 ? ` em ${p.parcelas}x de ${brl(cobrado / p.parcelas)}` : ' à vista no crédito'}${p.juros_valor ? ` <span class="mut">(${brl(p.valor)} + ${pct(p.juros_pct / 100)} de juros = ${brl(p.juros_valor)})</span>` : ''}`
+    : `Cliente paga <b>${brl(p.valor)}</b> no ${esc(p.forma.toLowerCase())}.`) : '<span class="mut">Informe o valor.</span>';
+  const tx = document.getElementById(pre + '_taxa');
+  if (tx && !tx.dataset.mexido) tx.value = String(r2(cobrado * (CFG().taxas[p.forma] || 0))).replace('.',',');
+}
+function lerPagamento(pre){
+  const forma = val(pre + '_forma') || 'Pix', valor = r2(pn(val(pre + '_valor'))), cred = ehCredito(forma);
+  const juros_pct = cred ? pn(val(pre + '_juros')) : 0, parcelas = cred ? (+val(pre + '_parc') || 1) : 1;
+  return {valor, forma, data: val(pre + '_data') || hoje(), juros_pct, parcelas, juros_valor: r2(valor * juros_pct / 100), taxa: r2(pn(val(pre + '_taxa'))), obs: val(pre + '_obs').trim()};
+}
+async function gravarPagamento(venda_id, p){
+  return DB.ins('pagamentos', {venda_id, valor: r2(p.valor), forma: p.forma, data: p.data || hoje(), taxa: r2(p.taxa || 0), obs: p.obs || '',
+    juros_pct: p.juros_pct || 0, juros_valor: r2(p.juros_valor || 0), parcelas: p.parcelas || 1, registrado_por: EU.nome || EU.usuario});
+}
+const descPag = p => `${esc(p.forma)}${ehCredito(p.forma) && (+p.parcelas > 1 || +p.juros_pct) ? ` · ${p.parcelas || 1}x${+p.juros_pct ? ` com ${nf(p.juros_pct)}% de juros` : ''}` : ''}`;
 function formPagamento(vid){
   const v = byId('vendas', vid), sd = Math.max(0, saldoVenda(v));
-  modal(`Pagamento · venda Nº ${v.numero}`, `<p class="mut" style="margin-top:0">${esc(nomeCli(v.cliente_id))} · total ${brl(v.total)} · falta ${brl(sd)}</p>
-  <div class="fg">${fld('Valor recebido (R$) *', dec('pg_valor', sd, 'oninput="taxaPg()"'))}${fld('Forma', `<select id="pg_forma" onchange="taxaPg()">${opts(FORMAS, 'Pix')}</select>`)}${fld('Data', inp('pg_data', hoje(), 'type="date"'))}
-  ${fld('Taxa da maquininha / plataforma (R$)', dec('pg_taxa', ''), '', 'Calculada pelas taxas em Financeiro › Ajustes. Pode corrigir.')}
-  ${fld('Observação', inp('pg_obs', '', 'placeholder="Ex.: sinal de 50%"'), 'full')}</div>`,
+  modal(`Pagamento · venda Nº ${v.numero}`, `<p class="mut" style="margin-top:0">${esc(nomeCli(v.cliente_id))} · total ${brl(v.total)} · falta ${brl(sd)}</p>${camposPagamento('pg', sd)}`,
   `<button class="bt sec" onclick="verVenda('${vid}')">Voltar</button><button class="bt" onclick="salvarPagamento('${vid}')">Registrar pagamento</button>`);
-  taxaPg();
+  calcPag('pg');
 }
-function taxaPg(){ const t = r2(pn(val('pg_valor')) * (CFG().taxas[val('pg_forma')] || 0)); $('#pg_taxa').value = String(t).replace('.',','); }
 async function salvarPagamento(vid){
-  const valor = pn(val('pg_valor')); if (valor <= 0) return toast('Informe o valor recebido.', true);
-  try { await gravarPagamento(vid, valor, val('pg_forma'), val('pg_data'), val('pg_obs').trim(), pn(val('pg_taxa'))); toast('Pagamento registrado'); verVenda(vid); render(); } catch(e){ falha(e); }
+  const p = lerPagamento('pg'); if (p.valor <= 0) return toast('Informe o valor recebido.', true);
+  try { await gravarPagamento(vid, p); toast('Pagamento registrado'); verVenda(vid); render(); } catch(e){ falha(e); }
 }
 async function excluirPagamento(pid, vid){ if (!confirmar('Excluir este pagamento?')) return;
   try { await DB.del('pagamentos', pid); toast('Pagamento excluído'); if (vid) verVenda(vid); render(); } catch(e){ falha(e); } }
@@ -923,15 +1002,73 @@ function vPagamentos(){
       <td><button class="bt mini" onclick="formPagamento('${v.id}')">Receber</button> ${(() => { const c = byId('clientes', v.cliente_id); return c && c.whatsapp ? `<a class="bt zap mini" target="_blank" href="${waLink(c.whatsapp, msgVenda(v))}">Cobrar</a>` : ''; })()}</td></tr>`).join('')}</tbody></table></div>` : '<div class="painel vazio">Nenhum valor em aberto. Tudo recebido.</div>';
   } else {
     const pgs = S.pagamentos.filter(p => noPer(p.data)).sort((a,b) => (b.data || '').localeCompare(a.data || ''));
-    const porForma = {}; pgs.forEach(p => { porForma[p.forma] = porForma[p.forma] || {v:0, t:0}; porForma[p.forma].v += +p.valor || 0; porForma[p.forma].t += +p.taxa || 0; });
-    const tot = pgs.reduce((s, p) => s + (+p.valor || 0), 0), tx = pgs.reduce((s, p) => s + (+p.taxa || 0), 0);
+    const porForma = {}; pgs.forEach(p => { porForma[p.forma] = porForma[p.forma] || {v:0, t:0}; porForma[p.forma].v += (+p.valor || 0) + (+p.juros_valor || 0); porForma[p.forma].t += +p.taxa || 0; });
+    const jr = pgs.reduce((s, p) => s + (+p.juros_valor || 0), 0), tot = pgs.reduce((s, p) => s + (+p.valor || 0), 0) + jr, tx = pgs.reduce((s, p) => s + (+p.taxa || 0), 0);
     html += `<div class="filtros">${filtroPeriodo()}</div>
-    <div class="kpis"><div class="kpi escuro"><span>Recebido no período</span><b>${brl(tot)}</b><small>${pgs.length} pagamentos</small></div><div class="kpi"><span>Taxas pagas</span><b>${brl(tx)}</b></div><div class="kpi"><span>Líquido</span><b>${brl(tot - tx)}</b></div>
+    <div class="kpis"><div class="kpi escuro"><span>Recebido no período</span><b>${brl(tot)}</b><small>${pgs.length} pagamentos</small></div><div class="kpi"><span>Juros de cartão recebidos</span><b>${brl(jr)}</b></div><div class="kpi"><span>Taxas pagas</span><b>${brl(tx)}</b></div><div class="kpi"><span>Líquido</span><b>${brl(tot - tx)}</b></div>
     <div class="kpi"><span>Por forma</span><small style="font-size:14.5px;color:var(--txt)">${Object.entries(porForma).map(([k, d]) => `${esc(k)}: ${brl(d.v)}`).join('<br>') || '—'}</small></div></div>`;
     html += pgs.length ? `<div class="tblw"><table class="t resp"><thead><tr><th>Data</th><th>Venda</th><th>Cliente</th><th>Forma</th><th class="n">Valor</th><th class="n">Taxa</th><th></th></tr></thead><tbody>
-      ${pgs.map(p => { const v = byId('vendas', p.venda_id); return `<tr><td class="prim">${fd(p.data)}</td><td data-l="Venda">${v ? `<button class="lk" onclick="verVenda('${v.id}')">Nº ${v.numero}</button>` : '—'}</td><td data-l="Cliente">${v ? esc(nomeCli(v.cliente_id)) : '—'}</td><td data-l="Forma">${esc(p.forma)}</td><td class="n" data-l="Valor">${brl(p.valor)}</td><td class="n" data-l="Taxa">${brl(p.taxa)}</td><td>${ehGestor() ? `<button class="lk peq" onclick="excluirPagamento('${p.id}')">excluir</button>` : ''}</td></tr>`; }).join('')}</tbody></table></div>` : '<div class="painel vazio">Nenhum pagamento neste período.</div>';
+      ${pgs.map(p => { const v = byId('vendas', p.venda_id); return `<tr><td class="prim">${fd(p.data)}</td><td data-l="Venda">${v ? `<button class="lk" onclick="verVenda('${v.id}')">Nº ${v.numero}</button>` : '—'}</td><td data-l="Cliente">${v ? esc(nomeCli(v.cliente_id)) : '—'}</td><td data-l="Forma">${descPag(p)}</td><td class="n" data-l="Valor">${brl((+p.valor || 0) + (+p.juros_valor || 0))}${+p.juros_valor ? `<br><span class="mut peq">juros ${brl(p.juros_valor)}</span>` : ''}</td><td class="n" data-l="Taxa">${brl(p.taxa)}</td><td>${ehGestor() ? `<button class="lk peq" onclick="excluirPagamento('${p.id}')">excluir</button>` : ''}</td></tr>`; }).join('')}</tbody></table></div>` : '<div class="painel vazio">Nenhum pagamento neste período.</div>';
   }
   return html;
+}
+
+/* =====================================================================
+   CUPONS
+   ===================================================================== */
+const descCupom = c => c.tipo === 'frete_gratis' ? 'frete grátis' : nf(c.percentual) + '% de desconto';
+const cupomFG = v => { const c = v.cupom_id && byId('cupons', v.cupom_id); return c ? c.tipo === 'frete_gratis' : (!!v.cupom_codigo && !+v.cupom_desconto); };
+function cupomValido(c){ return c.ativo !== false && (!c.validade || c.validade >= hoje()); }
+function cuponsParaVenda(atual){ return S.cupons.filter(c => cupomValido(c) || c.id === atual).sort((a,b) => a.codigo.localeCompare(b.codigo)); }
+function metricasCupom(c, de, ate){
+  const vs = S.vendas.filter(v => v.cupom_id === c.id && ATIVA(v.status) && (!de || (v.data >= de && v.data <= ate)));
+  const fat = vs.reduce((s, v) => s + (+v.total || 0), 0), desc = vs.reduce((s, v) => s + (+v.cupom_desconto || 0) + (+v.frete_dispensado || 0), 0);
+  const custo = vs.reduce((s, v) => s + (+v.custo_total || 0), 0);
+  const clis = [...new Set(vs.map(v => v.cliente_id).filter(Boolean))];
+  const novos = vs.filter(v => { if (!v.cliente_id) return false; const prim = S.vendas.filter(x => x.cliente_id === v.cliente_id && ATIVA(x.status)).sort((a,b) => (a.data || '').localeCompare(b.data || '') || (a.numero || 0) - (b.numero || 0))[0]; return prim && prim.id === v.id; }).length;
+  return {usos: vs.length, fat, desc, custo, lucro: fat - custo, clientes: clis.length, novos, ticket: vs.length ? fat / vs.length : 0, retorno: desc ? fat / desc : NaN};
+}
+function vCupons(){
+  if (S._semCupons) return `<div class="nota">Os cupons precisam de uma atualização no banco de dados. Rode o arquivo <b>vespera_atualizacao_cupons.sql</b> no SQL Editor do Supabase e recarregue a página.</div>`;
+  const de = U.per.de, ate = U.per.ate;
+  const vsPer = S.vendas.filter(v => ATIVA(v.status) && noPer(v.data)), comCupom = vsPer.filter(v => v.cupom_id || v.cupom_codigo);
+  const ms = S.cupons.map(c => ({c, m: metricasCupom(c, de, ate), tudo: metricasCupom(c)})).sort((a,b) => b.m.usos - a.m.usos || a.c.codigo.localeCompare(b.c.codigo));
+  const descTot = comCupom.reduce((s, v) => s + (+v.cupom_desconto || 0) + (+v.frete_dispensado || 0), 0), fatTot = comCupom.reduce((s, v) => s + (+v.total || 0), 0);
+  return `<div class="filtros">${filtroPeriodo()}</div>
+  <div class="kpis"><div class="kpi escuro"><span>Vendas com cupom</span><b>${comCupom.length}</b><small>${pct(vsPer.length ? comCupom.length / vsPer.length : NaN)} das vendas do período</small></div>
+    <div class="kpi"><span>Faturamento com cupom</span><b>${brl(fatTot)}</b></div>
+    <div class="kpi"><span>Total concedido</span><b>${brl(descTot)}</b><small>descontos + fretes dispensados</small></div>
+    <div class="kpi"><span>Retorno</span><b>${isFinite(fatTot / descTot) && descTot ? nf(fatTot / descTot, 1) + '×' : '—'}</b><small>faturamento para cada R$ 1 concedido</small></div></div>
+  ${ms.length ? `<div class="tblw"><table class="t resp"><thead><tr><th>Cupom</th><th>Benefício</th><th class="n">Usos no período</th><th class="n">Clientes novos</th><th class="n">Faturamento</th><th class="n">Concedido</th><th class="n">Lucro bruto</th><th class="n">Retorno</th><th class="n">Usos total</th><th>Situação</th></tr></thead><tbody>
+  ${ms.map(({c, m, tudo}) => `<tr class="clic" onclick="formCupom('${c.id}')"><td class="prim nw">${esc(c.codigo)}</td><td data-l="Benefício" class="nw">${descCupom(c)}</td><td class="n" data-l="Usos no período">${m.usos}</td><td class="n" data-l="Clientes novos">${m.novos}</td><td class="n" data-l="Faturamento">${brl(m.fat)}</td><td class="n" data-l="Concedido">${brl(m.desc)}</td><td class="n" data-l="Lucro bruto">${brl(m.lucro)}</td><td class="n" data-l="Retorno">${isFinite(m.retorno) ? nf(m.retorno, 1) + '×' : '—'}</td><td class="n" data-l="Usos desde a criação">${tudo.usos}</td>
+    <td>${cupomValido(c) ? '<span class="bd ok">Ativo</span>' : `<span class="bd nv0">${c.ativo === false ? 'Desativado' : 'Vencido'}</span>`}</td></tr>`).join('')}</tbody></table></div>
+  <p class="mut peq"><b>Retorno</b> = faturamento das vendas com o cupom ÷ valor concedido (descontos e fretes dispensados). Acima de 1× o cupom trouxe mais vendas do que custou em desconto. <b>Clientes novos</b> = vendas com o cupom que foram a primeira compra da pessoa.</p>`
+  : '<div class="painel vazio">Nenhum cupom ainda. Crie um cupom de porcentagem ou de frete grátis para usar nas vendas.</div>'}`;
+}
+function formCupom(id){
+  const c = id ? byId('cupons', id) : {tipo: 'percentual', ativo: true};
+  const t = id ? metricasCupom(c) : null;
+  modal(id ? `Cupom ${esc(c.codigo)}` : 'Novo cupom', `${t ? `<div class="kpis" style="margin-top:0"><div class="kpi"><span>Usos</span><b>${t.usos}</b></div><div class="kpi"><span>Faturamento</span><b>${brl(t.fat)}</b></div><div class="kpi"><span>Concedido</span><b>${brl(t.desc)}</b></div><div class="kpi"><span>Clientes novos</span><b>${t.novos}</b></div></div>` : ''}
+  <div class="fg" style="margin-top:14px">${fld('Código *', inp('cp_cod', c.codigo, 'placeholder="Ex.: VESPERA10"'), '', 'Sem espaços. É o que o cliente informa.')}
+    ${fld('Tipo', `<select id="cp_tipo" onchange="document.getElementById('boxPct').style.display=this.value==='percentual'?'':'none'">${opts([['percentual','Porcentagem de desconto'],['frete_gratis','Frete grátis']], c.tipo)}</select>`)}
+    <div class="f" id="boxPct" style="${c.tipo === 'percentual' ? '' : 'display:none'}"><label>Desconto (%) *</label>${dec('cp_pct', c.percentual || '')}<div class="dica">Aplicado sobre o valor dos produtos.</div></div>
+    ${fld('Válido até', inp('cp_val', c.validade, 'type="date"'), '', 'Opcional.')}
+    ${fld('Situação', `<select id="cp_ativo">${opts([['1','Ativo'],['0','Desativado']], c.ativo === false ? '0' : '1')}</select>`)}
+    ${fld('Onde foi divulgado', inp('cp_obs', c.obs, 'placeholder="Ex.: live de lançamento, post do Dia das Mães"'), 'full')}</div>`,
+  `${id ? `<button class="bt perigo esq" onclick="excluirCupom('${id}')">Excluir</button>` : ''}<button class="bt sec" onclick="fechar()">Cancelar</button><button class="bt" onclick="salvarCupom('${id || ''}')">Salvar cupom</button>`);
+}
+async function salvarCupom(id){
+  const o = {codigo: MAIUS(val('cp_cod').trim()).replace(/\s+/g, ''), tipo: val('cp_tipo'), percentual: val('cp_tipo') === 'percentual' ? pn(val('cp_pct')) : 0,
+    validade: val('cp_val') || null, ativo: val('cp_ativo') === '1', obs: val('cp_obs').trim()};
+  if (!o.codigo) return toast('Informe o código do cupom.', true);
+  if (o.tipo === 'percentual' && !(o.percentual > 0 && o.percentual <= 100)) return toast('Informe uma porcentagem entre 1 e 100.', true);
+  if (S.cupons.some(x => x.id !== id && x.codigo === o.codigo)) return toast('Já existe um cupom com esse código.', true);
+  try { if (id) await DB.upd('cupons', id, o); else await DB.ins('cupons', o); fechar(); render(); toast('Cupom salvo'); } catch(e){ falha(e); }
+}
+async function excluirCupom(id){
+  if (S.vendas.some(v => v.cupom_id === id)) return toast('Este cupom já foi usado em vendas. Desative em vez de excluir, para manter as métricas.', true);
+  if (!confirmar('Excluir este cupom?')) return;
+  try { await DB.del('cupons', id); fechar(); render(); toast('Cupom excluído'); } catch(e){ falha(e); }
 }
 
 /* =====================================================================
@@ -1017,21 +1154,22 @@ async function excluirProduto(id){
 /* =====================================================================
    ESTOQUE
    ===================================================================== */
-function despMaterial(mid){ let real = 0, prev = 0; S.producoes.forEach(p => (p.consumo || []).forEach(c => { if (c.material_id === mid){ real += +c.real || 0; prev += +c.previsto || 0; } })); return {real, prev, perda: real - prev, pct: real ? (real - prev) / real : NaN}; }
+function despMaterial(mid){ return perdasEstoque(null, null, mid); }
 function vEstoque(){
   const at = subAt('estoque', 'materiais');
   let html = `<div class="topo"><div><h1 class="tit">Estoque</h1><p class="sub">Materiais, produção e velas prontas.</p></div>
     <div class="acoes">${at === 'materiais' ? '<button class="bt" onclick="formMaterial()">Novo material</button>' : ''}${at === 'producao' ? '<button class="bt" onclick="formProducao()">Registrar produção</button>' : ''}</div></div>`;
-  html += tabs('estoque', [['materiais','Materiais'],['producao','Produção e desperdício'],['prontas','Velas prontas'],['movs','Movimentações']]);
+  html += tabs('estoque', [['materiais','Materiais'],['producao','Produção'],['desperdicio','Desperdício e testes'],['prontas','Velas prontas'],['movs','Movimentações']]);
+  html += '<div class="est">';
   if (at === 'materiais'){
     const ms = S.materiais.slice().sort((a,b) => (a.categoria || '').localeCompare(b.categoria || '') || a.nome.localeCompare(b.nome));
     const valor = ms.reduce((s, m) => s + Math.max(0, +m.qtd || 0) * (+m.custo_unit || 0), 0);
     html += `<div class="kpis"><div class="kpi escuro"><span>Valor em materiais</span><b>${brl(valor)}</b><small>${ms.length} materiais</small></div><div class="kpi"><span>Abaixo do mínimo</span><b>${ms.filter(m => (+m.minimo || 0) > 0 && (+m.qtd || 0) <= +m.minimo).length}</b></div></div>`;
-    html += ms.length ? `<div class="tblw"><table class="t resp"><thead><tr><th>Material</th><th>Categoria</th><th class="n">Em estoque</th><th class="n">Mínimo</th><th class="n">Custo / unidade</th><th class="n">Valor</th><th class="n">Desperdício médio</th><th></th></tr></thead><tbody>
+    html += ms.length ? `<div class="tblw"><table class="t resp"><thead><tr><th>Material</th><th>Categoria</th><th class="n">Em estoque</th><th class="n">Mínimo</th><th class="n">Custo / unidade</th><th class="n">Valor</th><th class="n">Desperdício</th><th></th></tr></thead><tbody>
     ${ms.map(m => { const d = despMaterial(m.id), baixo = (+m.minimo || 0) > 0 && (+m.qtd || 0) <= +m.minimo; return `<tr><td class="prim"><button class="lk" onclick="formMaterial('${m.id}')">${esc(m.nome)}</button>${m.fornecedor ? `<br><span class="mut peq">${esc(m.fornecedor)}</span>` : ''}</td><td data-l="Categoria">${esc(m.categoria || '—')}</td>
       <td class="n" data-l="Em estoque"><span class="${baixo ? 'bd alerta' : ''}">${nf(m.qtd)} ${unid(m)}</span></td><td class="n" data-l="Mínimo">${m.minimo ? nf(m.minimo) + ' ' + unid(m) : '—'}</td><td class="n" data-l="Custo por ${unid(m)}">${brl4(m.custo_unit)}/${unid(m)}</td><td class="n" data-l="Valor">${brl(Math.max(0, +m.qtd || 0) * (+m.custo_unit || 0))}</td>
-      <td class="n" data-l="Desperdício médio">${d.real ? `${pct(d.pct)} <span class="mut peq">(${nf(d.perda)} ${unid(m)})</span>` : '—'}</td>
-      <td style="white-space:nowrap"><button class="bt mini" onclick="formEntrada('${m.id}')">Entrada</button> <button class="bt sec mini" onclick="formAjuste('${m.id}')">Saída / ajuste</button> <button class="lk peq" style="margin-left:6px" onclick="excluirMaterial('${m.id}')">excluir</button></td></tr>`; }).join('')}</tbody></table></div>`
+      <td class="n" data-l="Desperdício">${d.despQ ? `${pct(d.pct)} <span class="mut peq">(${nf(d.despQ)} ${unid(m)})</span>` : '—'}</td>
+      <td style="white-space:nowrap"><button class="bt mini" onclick="formEntrada('${m.id}')">Entrada</button> <button class="bt sec mini" onclick="formAjuste('${m.id}','perda')">Perda / quebra</button> <button class="bt sec mini" onclick="formAjuste('${m.id}','teste')">Teste</button> <button class="bt sec mini" onclick="formAjuste('${m.id}','ajuste')">Contagem</button> <button class="lk peq" style="margin-left:6px" onclick="excluirMaterial('${m.id}')">excluir</button></td></tr>`; }).join('')}</tbody></table></div>`
     : '<div class="painel vazio">Nenhum material. Comece pela cera, essências, pavios e recipientes — cada um com sua unidade (g, ml ou unidade).</div>';
   }
   if (at === 'producao'){
@@ -1040,12 +1178,23 @@ function vEstoque(){
     const porMat = {}; ps.forEach(p => (p.consumo || []).forEach(c => { const k = c.material_id; porMat[k] = porMat[k] || {nome: c.nome, u: c.unidade, real: 0, prev: 0, custo: 0}; porMat[k].real += +c.real || 0; porMat[k].prev += +c.previsto || 0; porMat[k].custo += Math.max(0, (+c.real || 0) - (+c.previsto || 0)) * (+c.custo_unit || 0); }));
     html += `<div class="filtros">${filtroPeriodo()}</div>
     <div class="kpis"><div class="kpi escuro"><span>Velas produzidas</span><b>${nf(un, 0)}</b><small>${ps.length} lotes</small></div><div class="kpi"><span>Custo de material</span><b>${brl(ct)}</b><small>${un ? brl(ct / un) + ' por vela' : ''}</small></div><div class="kpi"><span>Perdido em desperdício</span><b class="${dc > 0 ? 'neg' : ''}">${brl(dc)}</b><small>${ct ? pct(dc / ct) + ' do custo' : ''}</small></div></div>
-    <div class="nota">Exemplo: 1.000 g de cera usados para 6 velas de 144 g → 864 g aproveitados e <b>136 g de desperdício (13,6%)</b>. Ao registrar um lote, informe quanto de cada material saiu do estoque de verdade; o sistema compara com a receita.</div>`;
-    const pm = Object.values(porMat).filter(m => m.real > 0);
-    if (pm.length) html += `<h2>Desperdício por material</h2><div class="tblw"><table class="t resp"><thead><tr><th>Material</th><th class="n">Usado</th><th class="n">Aproveitado</th><th class="n">Desperdício</th><th class="n">%</th><th class="n">Custo perdido</th></tr></thead><tbody>
-      ${pm.sort((a,b) => b.custo - a.custo).map(m => `<tr><td class="prim">${esc(m.nome)}</td><td class="n" data-l="Usado">${nf(m.real)} ${m.u}</td><td class="n" data-l="Aproveitado">${nf(m.prev)} ${m.u}</td><td class="n" data-l="Desperdício">${nf(m.real - m.prev)} ${m.u}</td><td class="n" data-l="%">${pct((m.real - m.prev) / m.real)}</td><td class="n" data-l="Custo perdido">${brl(m.custo)}</td></tr>`).join('')}</tbody></table></div>`;
+    <div class="nota">Exemplo: 1.000 g de cera usados para 6 velas de 144 g → 864 g aproveitados e <b>136 g de desperdício (13,6%)</b>. Ao registrar um lote, informe quanto de cada material saiu do estoque de verdade; o sistema compara com a receita. O resumo completo (lotes, perdas, contagem e testes) fica na aba <button class="lk" onclick="sub('estoque','desperdicio')">Desperdício e testes</button>.</div>`;
     html += `<h2>Lotes</h2>` + (ps.length ? `<div class="tblw"><table class="t resp"><thead><tr><th>Data</th><th>Produto</th><th class="n">Velas</th><th class="n">Custo do lote</th><th class="n">Custo por vela</th><th class="n">Desperdício</th></tr></thead><tbody>
       ${ps.map(p => `<tr class="clic" onclick="verProducao('${p.id}')"><td class="prim">${fd(p.data)}</td><td data-l="Produto">${esc(byId('produtos', p.produto_id)?.nome || p.produto_nome || '—')}</td><td class="n" data-l="Velas">${p.qtd}</td><td class="n" data-l="Custo do lote">${brl(p.custo_total)}</td><td class="n" data-l="Custo por vela">${brl(p.qtd ? p.custo_total / p.qtd : 0)}</td><td class="n" data-l="Desperdício">${brl(p.desperdicio_custo)}</td></tr>`).join('')}</tbody></table></div>` : '<div class="painel vazio">Nenhum lote neste período. Registre a produção para dar baixa nos materiais e somar velas prontas.</div>');
+  }
+  if (at === 'desperdicio'){
+    const t = perdasEstoque(U.per.de, U.per.ate);
+    const linhas = S.materiais.map(m => ({m, r: perdasEstoque(U.per.de, U.per.ate, m.id)})).filter(x => x.r.usadoQ || x.r.testeQ).sort((a,b) => (b.r.despV + b.r.testeV) - (a.r.despV + a.r.testeV));
+    html += `<div class="filtros">${filtroPeriodo()}</div>
+    <div class="kpis"><div class="kpi escuro"><span>Desperdício total</span><b>${brl(t.despV)}</b><small>${isFinite(t.pct) ? pct(t.pct) + ' do material que saiu do estoque' : ''}</small></div>
+      <div class="kpi"><span>Sobra de produção</span><b>${brl(t.prodV)}</b><small>usado além da receita nos lotes</small></div>
+      <div class="kpi"><span>Perdas e quebras</span><b>${brl(t.perdaV)}</b><small>registradas no botão Perda / quebra</small></div>
+      <div class="kpi"><span>Diferença na contagem</span><b>${brl(t.contV)}</b><small>faltou no estoque contado</small></div>
+      <div class="kpi"><span>Testes</span><b>${brl(t.testeV)}</b><small>não é desperdício</small></div></div>
+    <div class="nota"><b>Como o desperdício é calculado.</b> Entram três coisas: (1) na produção, o que saiu do estoque além do que a receita pedia; (2) o que você registrar em <b>Perda / quebra</b>; (3) na <b>Contagem</b>, quando o estoque contado dá menos do que o sistema esperava (a diferença é perda sem causa identificada; se der mais, só corrige o saldo). <b>Testes</b> ficam separados: são investimento em produto, não desperdício. O percentual é o desperdício dividido por tudo o que saiu do estoque (produção, perdas, contagem e testes).</div>
+    ${linhas.length ? `<div class="tblw"><table class="t resp"><thead><tr><th>Material</th><th class="n">Saiu do estoque</th><th class="n">Sobra de produção</th><th class="n">Perdas e quebras</th><th class="n">Contagem</th><th class="n">Desperdício</th><th class="n">%</th><th class="n">Custo perdido</th><th class="n">Testes</th></tr></thead><tbody>
+    ${linhas.map(({m, r}) => { const u = unid(m); return `<tr><td class="prim">${esc(m.nome)}</td><td class="n" data-l="Saiu do estoque">${nf(r.usadoQ)} ${u}</td><td class="n" data-l="Sobra de produção">${r.prodQ ? nf(r.prodQ) + ' ' + u : '—'}</td><td class="n" data-l="Perdas e quebras">${r.perdaQ ? nf(r.perdaQ) + ' ' + u : '—'}</td><td class="n" data-l="Contagem">${r.contQ ? nf(r.contQ) + ' ' + u : '—'}</td><td class="n" data-l="Desperdício"><b style="font-weight:400">${nf(r.despQ)} ${u}</b></td><td class="n" data-l="%">${pct(r.pct)}</td><td class="n" data-l="Custo perdido">${brl(r.despV)}</td><td class="n" data-l="Testes">${r.testeQ ? `${nf(r.testeQ)} ${u} · ${brl(r.testeV)}` : '—'}</td></tr>`; }).join('')}</tbody></table></div>`
+    : '<div class="painel vazio">Nada registrado neste período.</div>'}`;
   }
   if (at === 'prontas'){
     const ps = S.produtos.filter(p => p.ativo !== false || (+p.estoque || 0) !== 0).sort((a,b) => a.nome.localeCompare(b.nome));
@@ -1058,11 +1207,10 @@ function vEstoque(){
   }
   if (at === 'movs'){
     const mv = S.movimentos.filter(m => noPer(m.data)).sort((a,b) => (b.data || '').localeCompare(a.data || '') || (b.created_at || '').localeCompare(a.created_at || ''));
-    const rot = {entrada:'Entrada', saida:'Saída', ajuste:'Ajuste', producao:'Produção', inicial:'Saldo inicial'};
-    html += `<div class="filtros">${filtroPeriodo()}</div>` + (mv.length ? `<div class="tblw"><table class="t resp"><thead><tr><th>Data</th><th>Material</th><th>Tipo</th><th class="n">Quantidade</th><th class="n">Valor</th><th>Observação</th></tr></thead><tbody>
-    ${mv.map(x => { const m = byId('materiais', x.material_id); return `<tr><td class="prim">${fd(x.data)}</td><td data-l="Material">${esc(m ? m.nome : '—')}</td><td data-l="Tipo">${rot[x.tipo] || esc(x.tipo)}</td><td class="n ${+x.qtd < 0 ? 'neg' : 'pos'}" data-l="Quantidade">${+x.qtd > 0 ? '+' : ''}${nf(x.qtd)} ${m ? unid(m) : ''}</td><td class="n" data-l="Valor">${+x.valor ? brl(x.valor) : '—'}</td><td data-l="Observação">${esc(x.obs || '')}</td></tr>`; }).join('')}</tbody></table></div>` : '<div class="painel vazio">Nenhuma movimentação neste período.</div>');
+    html += `<div class="filtros">${filtroPeriodo()}</div>` + (mv.length ? `<div class="tblw"><table class="t resp"><thead><tr><th>Data</th><th>Material</th><th>Tipo</th><th class="n">Quantidade</th><th class="n">Valor</th><th>Observação</th><th></th></tr></thead><tbody>
+    ${mv.map(x => { const m = byId('materiais', x.material_id); return `<tr><td class="prim">${fd(x.data)}</td><td data-l="Material">${esc(m ? m.nome : '—')}</td><td data-l="Tipo">${['perda','teste','saida'].includes(x.tipo) ? `<select onchange="reclassificar('${x.id}',this.value)" style="padding:4px 6px;border:1px solid #dcc7bb;border-radius:5px;background:#fff">${opts([['perda','Perda / quebra'],['teste','Teste']].concat(x.tipo === 'saida' ? [['saida','Saída (sem tipo)']] : []), x.tipo)}</select>` : (x.tipo === 'ajuste' ? (+x.qtd < 0 ? 'Contagem (faltou)' : 'Contagem (sobrou)') : TIPO_MOV[x.tipo] || esc(x.tipo))}</td><td class="n ${+x.qtd < 0 ? 'neg' : 'pos'}" data-l="Quantidade">${+x.qtd > 0 ? '+' : ''}${nf(x.qtd)} ${m ? unid(m) : ''}</td><td class="n" data-l="Valor">${+x.valor ? brl(x.valor) : '—'}</td><td data-l="Observação">${esc(x.obs || '')}</td><td>${x.tipo === 'producao' ? '<span class="mut peq">pelo lote</span>' : `<button class="lk peq" onclick="excluirMovimento('${x.id}')">excluir</button>`}</td></tr>`; }).join('')}</tbody></table></div>` : '<div class="painel vazio">Nenhuma movimentação neste período.</div>');
   }
-  return html;
+  return html + '</div>';
 }
 const brl4 = v => 'R$ ' + (+v || 0).toLocaleString('pt-BR', {minimumFractionDigits: 2, maximumFractionDigits: 4});
 const FATORES = {g: [['1','g'],['1000','kg']], ml: [['1','ml'],['1000','litro']], un: [['1','unidade'],['10','pacote c/ 10'],['50','pacote c/ 50'],['100','pacote c/ 100']], m: [['1','metro']]};
@@ -1158,21 +1306,36 @@ async function salvarEntrada(id){
     fechar(); render(); toast('Entrada registrada');
   } catch(e){ falha(e); }
 }
-function formAjuste(id){
-  const m = byId('materiais', id);
-  modal(`Saída ou ajuste · ${esc(m.nome)}`, `<p class="mut" style="margin-top:0">No sistema: ${nf(m.qtd)} ${unid(m)}</p>
-  <div class="fg">${fld('O que aconteceu', `<select id="a_tipo" onchange="document.getElementById('a_lbl').textContent=this.value==='ajuste'?'Quantidade contada agora (${unid(m)})':'Quantidade que saiu (${unid(m)})'">${opts([['saida','Saída: perda, quebra, teste, uso fora da produção'],['ajuste','Ajuste: contei o estoque e está diferente']], 'saida')}</select>`, 'full')}
-  <div class="f"><label id="a_lbl">Quantidade que saiu (${unid(m)})</label>${dec('a_qtd', '')}</div>${fld('Data', inp('a_data', hoje(), 'type="date"'))}
-  ${fld('Motivo', inp('a_obs', '', 'placeholder="Ex.: vidro trincado, teste de aroma"'), 'full')}</div>`,
-  `<button class="bt sec" onclick="fechar()">Cancelar</button><button class="bt" onclick="salvarAjuste('${id}')">Salvar</button>`);
+const AJ = {
+  perda: {tit: 'Perda / quebra', lbl: 'Quantidade perdida', ph: 'Ex.: vidro trincado, cera derramada', nota: 'Conta como <b>desperdício</b>.'},
+  teste: {tit: 'Teste', lbl: 'Quantidade usada no teste', ph: 'Ex.: teste de nova essência, teste de pavio', nota: 'Fica separado nas métricas de <b>testes</b>. Não conta como desperdício.'},
+  ajuste: {tit: 'Contagem de estoque', lbl: 'Quantidade contada agora', ph: 'Ex.: contagem do fim do mês', nota: 'Se a contagem der <b>menos</b> do que o sistema, a diferença entra como desperdício (perda sem causa identificada). Se der mais, só corrige o saldo.'}};
+function formAjuste(id, tipo){
+  const m = byId('materiais', id), t = AJ[tipo] || AJ.perda;
+  modal(`${t.tit} · ${esc(m.nome)}`, `<p class="mut" style="margin-top:0">No sistema: ${nf(m.qtd)} ${unid(m)}</p><div class="nota" style="margin-top:0">${t.nota}</div>
+  <div class="fg"><div class="f"><label>${t.lbl} (${unid(m)}) *</label>${dec('a_qtd', '', tipo === 'ajuste' ? `oninput="difContagem('${id}')"` : '')}</div>${fld('Data', inp('a_data', hoje(), 'type="date"'))}
+  ${fld('Motivo / observação', inp('a_obs', '', `placeholder="${t.ph}"`), 'full')}</div><div id="a_res" class="mut" style="margin-top:8px"></div>`,
+  `<button class="bt sec" onclick="fechar()">Cancelar</button><button class="bt" onclick="salvarAjuste('${id}','${tipo}')">Salvar</button>`);
 }
-async function salvarAjuste(id){
-  const m = byId('materiais', id), tipo = val('a_tipo'), q = pn(val('a_qtd'));
-  if (val('a_qtd').trim() === '') return toast('Informe a quantidade.', true);
-  const delta = tipo === 'ajuste' ? q - (+m.qtd || 0) : -Math.abs(q);
-  if (!delta) return toast('Nada mudou no estoque.');
+function difContagem(id){ const m = byId('materiais', id), d = pn(val('a_qtd')) - (+m.qtd || 0); if (val('a_qtd').trim() === '') return $('#a_res').textContent = '';
+  $('#a_res').innerHTML = !d ? 'Bate com o sistema.' : d < 0 ? `Faltam <b>${nf(-d)} ${unid(m)}</b> (${brl(-d * (+m.custo_unit || 0))}): entra como desperdício.` : `Sobram ${nf(d)} ${unid(m)}: o saldo será corrigido.`; }
+async function salvarAjuste(id, tipo){
+  const m = byId('materiais', id), q = pn(val('a_qtd'));
+  if (val('a_qtd').trim() === '' || (tipo !== 'ajuste' && q <= 0)) return toast('Informe a quantidade.', true);
+  const delta = tipo === 'ajuste' ? r2(q - (+m.qtd || 0)) : -Math.abs(q);
+  if (!delta) return toast('A contagem bate com o sistema. Nada a ajustar.');
   try { await DB.ins('movimentos', {data: val('a_data') || hoje(), material_id: id, tipo, qtd: delta, valor: r2(Math.abs(delta) * (+m.custo_unit || 0)), obs: val('a_obs').trim()});
-    await DB.upd('materiais', id, {qtd: (+m.qtd || 0) + delta}); fechar(); render(); toast('Estoque atualizado'); } catch(e){ falha(e); }
+    await DB.upd('materiais', id, {qtd: r2((+m.qtd || 0) + delta)}); fechar(); render(); toast(`${AJ[tipo].tit} registrada`); } catch(e){ falha(e); }
+}
+async function reclassificar(mid, tipo){ try { await DB.upd('movimentos', mid, {tipo}); render(); toast('Tipo alterado para ' + TIPO_MOV[tipo]); } catch(e){ falha(e); } }
+async function excluirMovimento(mid){
+  const x = S.movimentos.find(y => y.id === mid), m = byId('materiais', x.material_id);
+  if (!confirmar(`Excluir esta movimentação (${TIPO_MOV[x.tipo] || x.tipo}, ${nf(x.qtd)} ${unid(m)})? O estoque do material volta como estava antes dela.`)) return;
+  const g = S.gastos.find(y => y.movimento_id === mid);
+  const apagarGasto = g && confirmar(`Essa entrada tem uma compra de ${brl(g.valor)} lançada no Financeiro. Apagar também?\n\nOK = apagar · Cancelar = manter`);
+  try { if (m) await DB.upd('materiais', m.id, {qtd: r2((+m.qtd || 0) - (+x.qtd || 0))});
+    if (apagarGasto) await DB.del('gastos', g.id);
+    await DB.del('movimentos', mid); render(); toast('Movimentação excluída'); } catch(e){ falha(e); }
 }
 function formAjusteProd(id){
   const p = byId('produtos', id);
@@ -1262,8 +1425,9 @@ function vFinanceiro(){
   const at = subAt('financeiro', 'resumo');
   let html = `<div class="topo"><div><h1 class="tit">Financeiro</h1><p class="sub">Faturamento, gastos, custo e lucro.</p></div>
     <div class="acoes">${at === 'gastos' ? '<button class="bt" onclick="formGasto()">Novo gasto</button>' : ''}</div></div>`;
-  html += tabs('financeiro', [['resumo','Resumo'],['gastos','Gastos'],['precos','Precificação'],['ajustes','Ajustes']]);
+  html += tabs('financeiro', [['resumo','Resumo'],['fxg','Faturamento x Gastos'],['gastos','Gastos'],['precos','Precificação'],['ajustes','Ajustes']]);
   if (at === 'resumo') html += finResumo();
+  if (at === 'fxg') html += finFxG();
   if (at === 'gastos') html += finGastos();
   if (at === 'precos') html += finPrecos();
   if (at === 'ajustes') html += finAjustes();
@@ -1288,7 +1452,10 @@ function finResumo(){
     <div class="kpi escuro"><span>Faturamento</span><b>${brl(r.fat)}</b><small>${r.n} vendas · ticket ${brl(r.ticket)}</small></div>
     <div class="kpi"><span>Custo dos produtos vendidos</span><b>${brl(r.cmv)}</b><small>material + desperdício + mão de obra</small></div>
     <div class="kpi"><span>Lucro bruto</span><b>${brl(r.bruto)}</b><small>${pct(r.fat ? r.bruto / r.fat : NaN)} do faturamento</small></div>
+    <div class="kpi"><span>Juros de cartão recebidos</span><b>${brl(r.juros)}</b><small>repassados ao cliente</small></div>
     <div class="kpi"><span>Taxas de pagamento</span><b>${brl(r.taxas)}</b></div>
+    <div class="kpi"><span>Perdas de estoque</span><b>${brl(r.perdas)}</b><small>perdas, quebras e falta na contagem</small></div>
+    <div class="kpi"><span>Testes</span><b>${brl(r.testes)}</b></div>
     <div class="kpi"><span>Despesas operacionais</span><b>${brl(r.desp)}</b><small>gastos, exceto compra de material</small></div>
     <div class="kpi escuro"><span>Lucro líquido</span><b class="${r.liq < 0 ? 'neg' : ''}">${brl(r.liq)}</b><small>margem ${pct(r.margem)}</small></div>
   </div>
@@ -1298,9 +1465,10 @@ function finResumo(){
     <div class="kpi"><span>Compras de material</span><b>${brl(r.compras)}</b></div>
     <div class="kpi"><span>Despesas + taxas</span><b>${brl(r.desp + r.taxas)}</b></div>
     <div class="kpi"><span>Saldo do caixa</span><b class="${r.caixa < 0 ? 'neg' : 'pos'}">${brl(r.caixa)}</b><small>recebido − tudo que saiu</small></div>
-    <div class="kpi"><span>Perdido em desperdício</span><b>${brl(r.desperd)}</b><small>na produção do período</small></div>
+    <div class="kpi"><span>Desperdício total</span><b>${brl(r.desperd)}</b><small>produção + perdas + contagem</small></div>
+    <div class="kpi"><span>Concedido em cupons</span><b>${brl(r.cupons)}</b><small>descontos + fretes grátis</small></div>
   </div>
-  <p class="mut peq">O lucro usa o custo das velas vendidas; o caixa usa o dinheiro que entrou e saiu. Comprar muito material num mês reduz o caixa, mas não o lucro.</p>
+  <p class="mut peq">Lucro líquido = faturamento − custo das velas vendidas + juros de cartão − taxas − despesas − perdas de estoque − testes. O lucro usa o custo das velas vendidas; o caixa usa o dinheiro que entrou e saiu. Comprar muito material num mês reduz o caixa, mas não o lucro.</p>
   <div class="cols" style="margin-top:20px">
     <div class="painel"><h3>Últimos 6 meses</h3>
       <div class="meses">${serie.map(s => `<div class="mes"><div class="par"><i style="height:${Math.max(2, s.fat / mx * 150)}px" title="Faturamento ${brl(s.fat)}"></i><i class="l" style="height:${Math.max(2, Math.max(0, s.liq) / mx * 150)}px" title="Lucro ${brl(s.liq)}"></i></div>${mesNome(s.m)}</div>`).join('')}</div>
@@ -1311,6 +1479,33 @@ function finResumo(){
   <h2>Por produto</h2>
   ${Object.keys(prod).length ? `<div class="tblw"><table class="t resp"><thead><tr><th>Produto</th><th class="n">Vendidas</th><th class="n">Receita</th><th class="n">Custo</th><th class="n">Lucro bruto</th><th class="n">Margem</th></tr></thead><tbody>
   ${Object.values(prod).sort((a,b) => (b.rec - b.custo) - (a.rec - a.custo)).map(p => `<tr><td class="prim">${esc(p.nome)}</td><td class="n" data-l="Vendidas">${p.q}</td><td class="n" data-l="Receita">${brl(p.rec)}</td><td class="n" data-l="Custo">${brl(p.custo)}</td><td class="n" data-l="Lucro bruto">${brl(p.rec - p.custo)}</td><td class="n" data-l="Margem">${pct(p.rec ? (p.rec - p.custo) / p.rec : NaN)}</td></tr>`).join('')}</tbody></table></div>` : '<div class="painel vazio">Sem vendas no período.</div>'}`;
+}
+function finFxG(){
+  const anos = [...new Set([hoje().slice(0,4), ...S.vendas.map(v => (v.data || '').slice(0,4)), ...S.gastos.map(g => (g.data || '').slice(0,4))].filter(Boolean))].sort().reverse();
+  const ano = U.filtro.ano || (U.filtro.ano = hoje().slice(0,4));
+  const nomes = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
+  const ms = nomes.map((n, i) => { const ini = `${ano}-${String(i + 1).padStart(2,'0')}-01`, r = resumoFin(ini, fimMes(ini));
+    const gastos = r.desp + r.compras + r.taxas; return {n, r, gastos, saldo: r.fat - gastos}; });
+  const T = k => ms.reduce((s, m) => s + (k(m) || 0), 0);
+  const tot = {fat: T(m => m.r.fat), rec: T(m => m.r.rec), desp: T(m => m.r.desp), comp: T(m => m.r.compras), tx: T(m => m.r.taxas), g: T(m => m.gastos), saldo: T(m => m.saldo), liq: T(m => m.r.liq)};
+  const mx = Math.max(1, ...ms.map(m => Math.max(m.r.fat, m.gastos)));
+  const cats = CAT_GASTO.filter(c => S.gastos.some(g => g.categoria === c && (g.data || '').startsWith(ano)));
+  const vg = (c, i) => S.gastos.filter(g => g.categoria === c && (g.data || '').startsWith(`${ano}-${String(i + 1).padStart(2,'0')}`)).reduce((s, g) => s + (+g.valor || 0), 0);
+  const cel = v => v ? brl(v) : '<span class="mut">—</span>';
+  return `<div class="filtros"><div><label>Ano</label><div class="chips">${anos.map(a => `<button class="chip ${a === ano ? 'on' : ''}" onclick="U.filtro.ano='${a}';render()">${a}</button>`).join('')}</div></div></div>
+  <div class="kpis"><div class="kpi escuro"><span>Faturamento ${ano}</span><b>${brl(tot.fat)}</b></div><div class="kpi"><span>Gastos ${ano}</span><b>${brl(tot.g)}</b><small>${pct(tot.fat ? tot.g / tot.fat : NaN)} do faturamento</small></div>
+    <div class="kpi"><span>Faturamento − gastos</span><b class="${tot.saldo < 0 ? 'neg' : 'pos'}">${brl(tot.saldo)}</b></div><div class="kpi escuro"><span>Lucro líquido ${ano}</span><b class="${tot.liq < 0 ? 'neg' : ''}">${brl(tot.liq)}</b><small>margem ${pct(tot.fat ? tot.liq / tot.fat : NaN)}</small></div></div>
+  <div class="painel" style="margin:18px 0"><h3>Mês a mês</h3>
+    <div class="meses" style="grid-template-columns:repeat(12,1fr)">${ms.map(m => `<div class="mes"><div class="par"><i style="height:${Math.max(2, m.r.fat / mx * 150)}px;width:12px" title="Faturamento ${brl(m.r.fat)}"></i><i style="height:${Math.max(2, m.gastos / mx * 150)}px;width:12px;background:var(--rose)" title="Gastos ${brl(m.gastos)}"></i></div>${m.n.slice(0,3).toLowerCase()}</div>`).join('')}</div>
+    <div class="legenda"><span><i style="background:var(--bordo)"></i>Faturamento</span><span><i style="background:var(--rose)"></i>Gastos</span></div></div>
+  <div class="tblw"><table class="t resp"><thead><tr><th>Mês</th><th class="n">Faturamento</th><th class="n">Recebido</th><th class="n">Despesas</th><th class="n">Compras de material</th><th class="n">Taxas</th><th class="n">Total de gastos</th><th class="n">Fat. − gastos</th><th class="n">Gastos / fat.</th><th class="n">Lucro líquido</th></tr></thead><tbody>
+  ${ms.map(m => `<tr><td class="prim nw">${m.n}</td><td class="n" data-l="Faturamento">${cel(m.r.fat)}</td><td class="n" data-l="Recebido">${cel(m.r.rec)}</td><td class="n" data-l="Despesas">${cel(m.r.desp)}</td><td class="n" data-l="Compras de material">${cel(m.r.compras)}</td><td class="n" data-l="Taxas">${cel(m.r.taxas)}</td><td class="n" data-l="Total de gastos"><b style="font-weight:400">${cel(m.gastos)}</b></td><td class="n ${m.saldo < 0 ? 'neg' : ''}" data-l="Faturamento − gastos">${m.r.fat || m.gastos ? brl(m.saldo) : '<span class="mut">—</span>'}</td><td class="n" data-l="Gastos / faturamento">${m.r.fat ? pct(m.gastos / m.r.fat) : '—'}</td><td class="n ${m.r.liq < 0 ? 'neg' : ''}" data-l="Lucro líquido">${m.r.fat || m.gastos ? brl(m.r.liq) : '<span class="mut">—</span>'}</td></tr>`).join('')}</tbody>
+  <tfoot><tr><td>Total</td><td class="n">${brl(tot.fat)}</td><td class="n">${brl(tot.rec)}</td><td class="n">${brl(tot.desp)}</td><td class="n">${brl(tot.comp)}</td><td class="n">${brl(tot.tx)}</td><td class="n">${brl(tot.g)}</td><td class="n">${brl(tot.saldo)}</td><td class="n">${tot.fat ? pct(tot.g / tot.fat) : '—'}</td><td class="n">${brl(tot.liq)}</td></tr></tfoot></table></div>
+  <p class="mut peq"><b>Faturamento − gastos</b> compara o que foi vendido com tudo que foi gasto no mês (despesas, compras de material e taxas). <b>Lucro líquido</b> usa o custo das velas vendidas no lugar das compras, por isso os dois números podem ser diferentes: comprar material em estoque pesa no primeiro, não no segundo.</p>
+  <h2>Gastos por categoria · ${ano}</h2>
+  ${cats.length ? `<div class="tblw"><table class="t"><thead><tr><th>Categoria</th>${nomes.map(n => `<th class="n">${n.slice(0,3)}</th>`).join('')}<th class="n">Total</th></tr></thead><tbody>
+  ${cats.map(c => { const vs = nomes.map((_, i) => vg(c, i)); return `<tr><td class="nw">${esc(c)}</td>${vs.map(v => `<td class="n">${v ? nf(v, 0) : '<span class="mut">—</span>'}</td>`).join('')}<td class="n"><b style="font-weight:400">${brl(vs.reduce((a, b) => a + b, 0))}</b></td></tr>`; }).join('')}</tbody>
+  <tfoot><tr><td>Total</td>${nomes.map((_, i) => { const t = cats.reduce((s, c) => s + vg(c, i), 0); return `<td class="n">${t ? nf(t, 0) : '<span class="mut">—</span>'}</td>`; }).join('')}<td class="n">${brl(cats.reduce((s, c) => s + nomes.reduce((a, _, i) => a + vg(c, i), 0), 0))}</td></tr></tfoot></table></div>` : '<div class="painel vazio">Nenhum gasto lançado neste ano.</div>'}`;
 }
 function finGastos(){
   const gs = S.gastos.filter(g => noPer(g.data)).sort((a,b) => (b.data || '').localeCompare(a.data || ''));
@@ -1438,12 +1633,13 @@ async function exemplo(){
     C.push(await DB.ins('clientes', {nome, whatsapp: zap, origem, nascimento: nasc || null, bairro, cidade: 'Brasília', indicado_por: ind === 0 ? (C[0] && C[0].id) : null, aromas: ''}));
   const it = (p, q) => ({produto_id: p.id, nome: p.nome, qtd: q, preco: p.preco, custo: custoReal(p)});
   const vendas = [[C[0], [it(P1,1)], d(-150), 'Entregue', 'Pix', true], [C[0], [it(P2,2)], d(-95), 'Entregue', 'Cartão de crédito', true], [C[0], [it(P3,1)], d(-20), 'Entregue', 'Pix', true],
-    [C[1], [it(P1,2)], d(-70), 'Entregue', 'Pix', true], [C[1], [it(P2,1)], d(-6), 'Pronta', 'Pix', false], [C[2], [it(P3,1)], d(-40), 'Entregue', 'Link de pagamento', true],
+    [C[1], [it(P1,2)], d(-70), 'Entregue', 'Pix', true], [C[1], [it(P2,1)], d(-6), 'Pronta', 'Pix', false], [C[2], [it(P3,1)], d(-40), 'Entregue', 'Cartão de crédito', true],
     [C[3], [it(P1,1), it(P2,1)], d(0), 'Em produção', 'Pix', 'metade'], [C[4], [it(P2,1)], d(0), 'Confirmada', 'Pix', false], [C[2], [it(P1,3)], d(-120), 'Entregue', 'Dinheiro', true]];
   for (const [c, itens, data, status, forma, pago] of vendas){
     const tot = r2(itens.reduce((s, i) => s + i.qtd * i.preco, 0));
     const v = await DB.ins('vendas', {data, cliente_id: c.id, canal: 'WhatsApp', status, itens, subtotal: tot, desconto: 0, frete: 0, total: tot, custo_total: r2(itens.reduce((s, i) => s + i.qtd * i.custo, 0)), entrega: 'Entrega', estoque_baixado: true, vendedor: 'Demonstração'});
-    if (pago) await gravarPagamento(v.id, pago === 'metade' ? r2(tot / 2) : tot, forma, data);
+    if (pago){ const valor = pago === 'metade' ? r2(tot / 2) : tot, cred = forma === 'Cartão de crédito';
+      await gravarPagamento(v.id, {valor, forma, data, parcelas: cred ? 2 : 1, juros_pct: cred ? 4 : 0, juros_valor: cred ? r2(valor * 0.04) : 0, taxa: r2(valor * (cred ? 1.04 : 1) * (CFG().taxas[forma] || 0))}); }
   }
   const prodEx = {produto_id: P1.id, produto_nome: P1.nome, qtd: 6, data: d(0), obs: 'Pacote de 1 kg de cera para 6 velas',
     consumo: [{material_id: M.cera.id, nome: M.cera.nome, unidade: 'g', custo_unit: M.cera.custo_unit, previsto: 780, real: 1000}, {material_id: M.lav.id, nome: M.lav.nome, unidade: 'ml', custo_unit: M.lav.custo_unit, previsto: 84, real: 88}, {material_id: M.pav.id, nome: M.pav.nome, unidade: 'un', custo_unit: M.pav.custo_unit, previsto: 6, real: 7}, {material_id: M.copo.id, nome: M.copo.nome, unidade: 'un', custo_unit: M.copo.custo_unit, previsto: 6, real: 6}, {material_id: M.tampa.id, nome: M.tampa.nome, unidade: 'un', custo_unit: M.tampa.custo_unit, previsto: 6, real: 6}, {material_id: M.rot.id, nome: M.rot.nome, unidade: 'un', custo_unit: M.rot.custo_unit, previsto: 6, real: 6}]};
@@ -1480,7 +1676,7 @@ function travar(nome){
 }
 ['salvarCliente','excluirCliente','salvarVenda','mudarStatus','excluirVenda','salvarPagamento','excluirPagamento','salvarProduto','excluirProduto',
  'salvarMaterial','excluirMaterial','salvarEntrada','salvarAjuste','salvarAjusteProd','salvarProducao','excluirProducao','salvarGasto','excluirGasto',
- 'aplicarPreco','salvarAjustes','salvarUsuario','salvarSenha'].forEach(travar);
+ 'aplicarPreco','salvarAjustes','salvarUsuario','salvarSenha','salvarCupom','excluirCupom','reclassificar','excluirMovimento'].forEach(travar);
 
 /* =====================================================================
    INÍCIO
