@@ -268,6 +268,9 @@ table.t tfoot td{border-top:1px solid var(--linha);font-weight:700}
 .nw{white-space:nowrap}
 @media (min-width:701px){.est table.t td{white-space:nowrap}}
 
+.rolagem-topo{overflow-x:auto;overflow-y:hidden;height:16px;margin-bottom:3px;background:var(--branco);border:1px solid var(--linha);border-radius:var(--r)}
+.rolagem-topo>div{height:1px}
+
 </style>
 </head>
 <body>
@@ -479,7 +482,7 @@ function render(){
   let html = '';
   if (DEMO) html += `<div class="demo"><span>Modo demonstração: os dados ficam só neste navegador. Conecte o Supabase para usar de verdade.</span>${S.produtos.length ? `<button onclick="limparDemo()">Apagar dados de teste</button>` : `<button onclick="exemplo()">Carregar dados de exemplo</button>`}</div>`;
   html += VIEWS[U.view]();
-  $('#main').innerHTML = html;
+  $('#main').innerHTML = html; barrasTopo();
 }
 function tabs(v, lista){ const at = U.sub[v] || lista[0][0];
   return `<div class="tabs">${lista.map(([k,l]) => `<button class="${at===k?'on':''}" onclick="sub('${v}','${k}')">${l}</button>`).join('')}</div>`; }
@@ -499,7 +502,7 @@ const noPer = d => d && d >= U.per.de && d <= U.per.ate;
 /* ---------- modal ---------- */
 function modal(titulo, corpo, pe, larga){
   $('#modal').innerHTML = `<div class="cx${larga ? ' larga' : ''}" role="dialog" aria-modal="true"><div class="cab"><h3>${titulo}</h3><button onclick="fechar()" aria-label="Fechar">×</button></div><div class="corpo">${corpo}</div>${pe ? `<div class="pe">${pe}</div>` : ''}</div>`;
-  $('#modal').classList.add('on'); document.body.style.overflow = 'hidden'; $('#modal').scrollTop = 0; maiusculasNoModal();
+  $('#modal').classList.add('on'); document.body.style.overflow = 'hidden'; $('#modal').scrollTop = 0; maiusculasNoModal(); barrasTopo();
   const f = $('#modal .corpo input, #modal .corpo select'); if (f && window.innerWidth > 700) setTimeout(() => f.focus(), 40);
 }
 function fechar(){ $('#modal').classList.remove('on'); $('#modal').innerHTML = ''; document.body.style.overflow = ''; }
@@ -521,6 +524,19 @@ document.addEventListener('input', e => { const el = e.target; if (!campoMaiuscu
 function maiusculasNoModal(){ document.querySelectorAll('#modal input, #modal textarea').forEach(el => { if (campoMaiusculo(el) && el.value) el.value = MAIUS(el.value); }); }
 /* primeiro nome para mensagens: MARINA ALBUQUERQUE → Marina */
 const primeiroNome = n => { const p = String(n || '').trim().split(/\s+/)[0] || ''; return p.charAt(0).toLocaleUpperCase('pt-BR') + p.slice(1).toLocaleLowerCase('pt-BR'); };
+/* barra de rolagem também em cima das tabelas largas, sincronizada com a de baixo */
+function barrasTopo(){
+  requestAnimationFrame(() => document.querySelectorAll('.tblw').forEach(t => {
+    let topo = t.previousElementSibling && t.previousElementSibling.classList.contains('rolagem-topo') ? t.previousElementSibling : null;
+    if (t.scrollWidth <= t.clientWidth + 1){ if (topo) topo.remove(); return; }
+    if (!topo){ topo = document.createElement('div'); topo.className = 'rolagem-topo'; topo.appendChild(document.createElement('div')); t.parentNode.insertBefore(topo, t);
+      let trava = false;
+      topo.addEventListener('scroll', () => { if (trava) return; trava = true; t.scrollLeft = topo.scrollLeft; requestAnimationFrame(() => trava = false); });
+      t.addEventListener('scroll', () => { if (trava) return; trava = true; topo.scrollLeft = t.scrollLeft; requestAnimationFrame(() => trava = false); }); }
+    topo.firstChild.style.width = t.scrollWidth + 'px'; topo.scrollLeft = t.scrollLeft;
+  }));
+}
+window.addEventListener('resize', () => { clearTimeout(window._rt); window._rt = setTimeout(barrasTopo, 150); });
 const fld = (lab, html, cls = '', dica = '') => `<div class="f ${cls}"><label>${lab}</label>${html}${dica ? `<div class="dica">${dica}</div>` : ''}</div>`;
 const inp = (id, v = '', at = '') => `<input id="${id}" value="${esc(v)}" ${at}>`;
 const dec = (id, v, at = '') => `<input id="${id}" inputmode="decimal" value="${v === '' || v == null ? '' : esc(String(v).replace('.',','))}" ${at}>`;
@@ -682,8 +698,8 @@ function tabelaClientes(lista){
 function reRenderLista(){ // busca sem perder o foco
   if (U.view === 'clientes'){ const f = U.filtro.cli, q = f.q.toLowerCase();
     const lista = S.clientes.map(c => ({c, m: metricasCli(c)})).filter(({c, m}) => (!q || [c.nome, c.whatsapp, c.instagram, c.email, c.bairro].join(' ').toLowerCase().includes(q) || (soDig(q) && soDig(c.whatsapp).includes(soDig(q)))) && (!f.origem || c.origem === f.origem) && (!f.nivel || nivel(m.n)[1] === f.nivel)).sort((a, b) => b.m.total - a.m.total || a.c.nome.localeCompare(b.c.nome));
-    $('#listaCli').innerHTML = tabelaClientes(lista); }
-  if (U.view === 'vendas') $('#listaVen').innerHTML = tabelaVendas(vendasFiltradas());
+    $('#listaCli').innerHTML = tabelaClientes(lista); barrasTopo(); }
+  if (U.view === 'vendas'){ $('#listaVen').innerHTML = tabelaVendas(vendasFiltradas()); barrasTopo(); }
 }
 
 function formCliente(id, depois){
@@ -1215,18 +1231,14 @@ function vEstoque(){
 const brl4 = v => 'R$ ' + (+v || 0).toLocaleString('pt-BR', {minimumFractionDigits: 2, maximumFractionDigits: 4});
 const FATORES = {g: [['1','g'],['1000','kg']], ml: [['1','ml'],['1000','litro']], un: [['1','unidade'],['10','pacote c/ 10'],['50','pacote c/ 50'],['100','pacote c/ 100']], m: [['1','metro']]};
 
+/* compra inicial do material: movimento "inicial" + gasto ligado a ele */
+const movInicial = id => S.movimentos.find(x => x.material_id === id && x.tipo === 'inicial');
+const gastoDoMov = mid => mid ? S.gastos.find(g => g.movimento_id === mid) : null;
 function formMaterial(id){
   const m = id ? byId('materiais', id) : {unidade: 'g', categoria: 'Cera'};
-  const un = unid(m);
-  const blocoValor = id
-    ? `<div class="secao"><h3>Custo</h3><span class="mut peq">hoje: ${brl4(m.custo_unit)} por ${un}</span></div>
-       <p class="mut peq" style="margin-top:0">Para corrigir o custo, informe uma quantidade e quanto ela custou. Deixe em branco para manter o custo atual.</p>
-       <div class="fg">${fld('Quantidade', `<div style="display:grid;grid-template-columns:1fr auto;gap:6px">${dec('m_qtd', '', 'oninput="calcMat()"')}<select id="m_fat" onchange="calcMat()" style="width:auto">${opts(FATORES[un] || FATORES.un, '1')}</select></div>`)}
-       ${fld('Valor pago por essa quantidade (R$)', dec('m_valor', '', 'oninput="calcMat()"'))}</div>`
-    : `<div class="secao"><h3>Estoque e custo</h3></div>
-       <div class="fg">${fld('Quantidade que você tem agora', `<div style="display:grid;grid-template-columns:1fr auto;gap:6px">${dec('m_qtd', '', 'oninput="calcMat()"')}<select id="m_fat" onchange="calcMat()" style="width:auto">${opts(FATORES.g, '1')}</select></div>`, '', 'Ex.: 2 kg de cera → 2 e escolha "kg".')}
-       ${fld('Valor total pago (R$)', dec('m_valor', '', 'oninput="calcMat()"'), '', 'Quanto custou essa quantidade toda. O sistema calcula o valor por unidade.')}
-       <div class="f full"><label style="display:flex;gap:8px;align-items:center;color:var(--txt)"><input type="checkbox" id="m_gasto"> Lançar esse valor como compra no Financeiro</label><div class="dica">Marque só se a compra foi feita agora. Material comprado antes de usar o sistema não precisa entrar como gasto.</div></div></div>`;
+  const un = unid(m), mi = id ? movInicial(id) : null, gi = mi ? gastoDoMov(mi.id) : null;
+  const qIni = mi ? +mi.qtd || 0 : '', vIni = mi ? (+mi.valor || r2((+mi.qtd || 0) * (+m.custo_unit || 0))) : '';
+  const fat = qIni && un === 'g' && qIni % 1000 === 0 ? '1000' : qIni && un === 'ml' && qIni % 1000 === 0 ? '1000' : '1';
   modal(id ? 'Editar material' : 'Novo material', `<div class="fg">
     ${fld('Nome *', inp('m_nome', m.nome, 'placeholder="Ex.: Cera vegetal de soja"'), 'w2')}
     ${fld('Categoria', `<select id="m_cat">${opts(CAT_MAT, m.categoria)}</select>`)}
@@ -1234,8 +1246,12 @@ function formMaterial(id){
     ${fld('Estoque mínimo', dec('m_min', m.minimo || ''), '', 'Na unidade de controle. Avisa no Painel quando chegar nesse nível.')}
     ${fld('Fornecedor', inp('m_forn', m.fornecedor))}
     ${fld('Observações', inp('m_obs', m.obs), 'full')}</div>
-    ${blocoValor}
-    <div class="caixa" id="m_res" style="margin-top:12px"></div>`,
+  <div class="secao"><h3>Compra</h3>${id ? `<span class="mut peq">${gi ? `lançada no Financeiro em ${fd(gi.data)}` : 'ainda não lançada no Financeiro'}</span>` : ''}</div>
+  ${id ? `<p class="mut peq" style="margin-top:0">A primeira compra deste material. Ao salvar, ela entra no Financeiro na data informada. Se mudar a quantidade, o estoque é ajustado pela diferença. Compras seguintes entram pelo botão Entrada.</p>` : ''}
+  <div class="fg">${fld('Quantidade comprada', `<div style="display:grid;grid-template-columns:1fr auto;gap:6px">${dec('m_qtd', qIni ? qIni / +fat : '', 'oninput="calcMat()"')}<select id="m_fat" onchange="calcMat()" style="width:auto">${opts(FATORES[un] || FATORES.un, fat)}</select></div>`, '', 'Ex.: 2 kg de cera → 2 e escolha "kg".')}
+    ${fld('Valor total pago (R$)', dec('m_valor', vIni || '', 'oninput="calcMat()"'), '', 'Quanto custou essa quantidade toda, com frete.')}
+    ${fld('Data da compra', inp('m_dcomp', (gi && gi.data) || (mi && mi.data) || hoje(), 'type="date"'), '', 'Pode ser uma data passada. A compra entra no Financeiro nessa data.')}</div>
+  <div class="caixa" id="m_res" style="margin-top:12px"></div>`,
   `${id ? `<button class="bt perigo esq" onclick="excluirMaterial('${id}')">Excluir</button>` : ''}<button class="bt sec" onclick="fechar()">Cancelar</button><button class="bt" onclick="salvarMaterial('${id || ''}')">Salvar material</button>`);
   calcMat();
 }
@@ -1244,25 +1260,33 @@ function calcMat(){
   const box = $('#m_res'); if (!box) return;
   const u = document.getElementById('m_un').value || 'un', q = pn(val('m_qtd')) * pn(val('m_fat') || 1), v = pn(val('m_valor'));
   if (q > 0 && v > 0) box.innerHTML = `${nf(q)} ${u} por ${brl(v)} → <b>${brl4(v / q)} por ${u}</b>`;
-  else if (q > 0) box.innerHTML = `${nf(q)} ${u}. <span class="mut">Informe o valor pago para calcular o custo por ${u}.</span>`;
+  else if (q > 0) box.innerHTML = `${nf(q)} ${u}. <span class="mut">Informe o valor pago para calcular o custo por ${u} e lançar a compra.</span>`;
   else box.innerHTML = '<span class="mut">Informe a quantidade e o valor pago.</span>';
 }
+/* custo médio = tudo que foi pago ÷ tudo que foi comprado (compra inicial + entradas) */
+function custoMedioCompras(mid){ let q = 0, v = 0; S.movimentos.filter(x => x.material_id === mid && (x.tipo === 'inicial' || x.tipo === 'entrada') && +x.valor > 0).forEach(x => { q += +x.qtd || 0; v += +x.valor || 0; }); return q > 0 ? Math.round(v / q * 1e6) / 1e6 : null; }
 async function salvarMaterial(id){
   const o = {nome: val('m_nome').trim(), categoria: val('m_cat'), minimo: pn(val('m_min')), fornecedor: val('m_forn').trim(), obs: val('m_obs').trim()};
   if (!o.nome) return toast('Informe o nome do material.', true);
-  const q = pn(val('m_qtd')) * pn(val('m_fat') || 1), v = r2(pn(val('m_valor')));
-  if (v > 0 && !(q > 0)) return toast('Informe a quantidade que corresponde a esse valor.', true);
-  if (q > 0 && v > 0) o.custo_unit = Math.round(v / q * 1e6) / 1e6;
   if (!id && S.materiais.some(x => x.nome === o.nome)) return toast('Já existe um material com esse nome. Edite o existente ou exclua a duplicata.', true);
+  const q = r2(pn(val('m_qtd')) * pn(val('m_fat') || 1)), v = r2(pn(val('m_valor'))), dc = val('m_dcomp') || hoje();
+  if (v > 0 && !(q > 0)) return toast('Informe a quantidade que corresponde a esse valor.', true);
   try {
-    if (id) await DB.upd('materiais', id, o);
-    else {
-      o.unidade = val('m_un'); if (o.custo_unit == null) o.custo_unit = 0;
-      const r = await DB.ins('materiais', {...o, qtd: q});
-      if (q){ const mv = await DB.ins('movimentos', {data: hoje(), material_id: r.id, tipo: 'inicial', qtd: q, valor: v, obs: 'Saldo inicial'});
-        if (chk('m_gasto') && v > 0) await DB.ins('gastos', {data: hoje(), categoria: 'Compra de material', descricao: `${o.nome} · ${nf(q)} ${o.unidade}`, valor: v, forma: '', pago: true, movimento_id: mv.id}); }
-    }
-    fechar(); render(); toast('Material salvo');
+    let mat, mi = id ? movInicial(id) : null;
+    const un = id ? unid(byId('materiais', id)) : val('m_un');
+    if (id){ const atual = byId('materiais', id), antes = mi ? +mi.qtd || 0 : 0;
+      mat = await DB.upd('materiais', id, {...o, qtd: r2((+atual.qtd || 0) + q - antes)}); }
+    else mat = await DB.ins('materiais', {...o, unidade: un, qtd: q, custo_unit: q > 0 && v > 0 ? Math.round(v / q * 1e6) / 1e6 : 0});
+    // movimento da compra inicial
+    if (q > 0){ const dm = {data: dc, qtd: q, valor: v, obs: 'Compra inicial'};
+      mi = mi ? await DB.upd('movimentos', mi.id, dm) : await DB.ins('movimentos', {...dm, material_id: mat.id, tipo: 'inicial'}); }
+    else if (mi){ await DB.del('movimentos', mi.id); const g0 = gastoDoMov(mi.id); if (g0) await DB.del('gastos', g0.id); mi = null; }
+    // gasto no Financeiro, sempre que houver valor
+    if (mi){ const g = gastoDoMov(mi.id), dg = {data: dc, categoria: 'Compra de material', descricao: `${o.nome} · ${nf(q)} ${un}`, valor: v, pago: true};
+      if (v > 0) { if (g) await DB.upd('gastos', g.id, dg); else await DB.ins('gastos', {...dg, forma: '', movimento_id: mi.id}); }
+      else if (g) await DB.del('gastos', g.id); }
+    const cm = custoMedioCompras(mat.id); if (cm != null && cm !== +mat.custo_unit) await DB.upd('materiais', mat.id, {custo_unit: cm});
+    fechar(); render(); toast(v > 0 ? `Material salvo · compra de ${brl(v)} lançada em ${fd(dc)}` : 'Material salvo');
   } catch(e){ falha(e); }
 }
 async function excluirMaterial(id){
@@ -1284,8 +1308,8 @@ function formEntrada(id){
   modal(`Entrada · ${esc(m.nome)}`, `<p class="mut" style="margin-top:0">Hoje: ${nf(m.qtd)} ${unid(m)} · custo médio ${brl4(m.custo_unit)}/${unid(m)}</p>
   <div class="fg">${fld('Quantidade comprada *', `<div style="display:grid;grid-template-columns:1fr auto;gap:6px">${dec('e_qtd', '', 'oninput="calcEntrada(\'' + id + '\')"')}<select id="e_fat" onchange="calcEntrada('${id}')" style="width:auto">${opts(FATORES[unid(m)] || FATORES.un, '1')}</select></div>`)}
   ${fld('Valor total pago (R$) *', dec('e_valor', '', 'oninput="calcEntrada(\'' + id + '\')"'), '', 'Inclua o frete da compra, se houver.')}
-  ${fld('Data', inp('e_data', hoje(), 'type="date"'))}${fld('Fornecedor', inp('e_forn', m.fornecedor))}
-  <div class="f full"><label style="display:flex;gap:8px;align-items:center;color:var(--txt)"><input type="checkbox" id="e_gasto" checked> Lançar esta compra como gasto no Financeiro</label></div></div>
+  ${fld('Data da compra', inp('e_data', hoje(), 'type="date"'))}${fld('Fornecedor', inp('e_forn', m.fornecedor))}
+  </div><p class="mut peq">A compra entra no Financeiro na data informada.</p>
   <div class="caixa" id="e_res" style="margin-top:12px"></div>`,
   `<button class="bt sec" onclick="fechar()">Cancelar</button><button class="bt" onclick="salvarEntrada('${id}')">Registrar entrada</button>`);
   calcEntrada(id);
@@ -1302,7 +1326,7 @@ async function salvarEntrada(id){
   try {
     const mv = await DB.ins('movimentos', {data: val('e_data') || hoje(), material_id: id, tipo: 'entrada', qtd: q, valor: v, obs: val('e_forn').trim()});
     await DB.upd('materiais', id, {qtd: (+m.qtd || 0) + q, custo_unit: v ? Math.round(nc * 1e6) / 1e6 : m.custo_unit, fornecedor: val('e_forn').trim() || m.fornecedor});
-    if (chk('e_gasto') && v > 0) await DB.ins('gastos', {data: val('e_data') || hoje(), categoria: 'Compra de material', descricao: `${m.nome} · ${nf(q)} ${unid(m)}`, valor: v, forma: '', pago: true, movimento_id: mv.id});
+    if (v > 0) await DB.ins('gastos', {data: val('e_data') || hoje(), categoria: 'Compra de material', descricao: `${m.nome} · ${nf(q)} ${unid(m)}`, valor: v, forma: '', pago: true, movimento_id: mv.id});
     fechar(); render(); toast('Entrada registrada');
   } catch(e){ falha(e); }
 }
